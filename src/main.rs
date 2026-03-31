@@ -1,22 +1,23 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 // Type of damages
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum DamageType {
     Pothole,
     CracksOnRoad,
-    WaterLeak
+    WaterLeak,
 }
 
 // Represents a GPS location
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct GPSLocation {
     latitude: f64,
     longitude: f64,
 }
 
 // Represents the status of a fix
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum FixStatus {
     Pending,
     InProgress,
@@ -24,7 +25,7 @@ enum FixStatus {
 }
 
 // Represents a damage report
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct DamageReport {
     damage_type: DamageType,
     location: GPSLocation,
@@ -38,7 +39,10 @@ struct DamageReport {
 fn main() {
     let report = DamageReport {
         damage_type: DamageType::Pothole,
-        location: GPSLocation { latitude: 40.7128, longitude: -74.0060 },
+        location: GPSLocation {
+            latitude: 40.7128,
+            longitude: -74.0060,
+        },
         severity: 3,
         description: "Pothole near the bridge".to_string(),
         image: None,
@@ -46,5 +50,11 @@ fn main() {
         status: FixStatus::Pending,
     };
 
-    println!("{:?}", report);
+    println!("Inital report\n{:?}", report);
+
+    let json = serde_json::to_string(&report).unwrap();
+    println!("JSON: {}", json);
+
+    let deserialized: DamageReport = serde_json::from_str(&json).unwrap();
+    println!("Deserialized: {:?}", deserialized);
 }
