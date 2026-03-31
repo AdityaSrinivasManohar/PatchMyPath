@@ -51,9 +51,11 @@ fn main() {
     };
 
     println!("Inital report\n{:?}", report);
+    println!("");
 
-    let json = serde_json::to_string(&report).unwrap();
-    println!("JSON: {}", json);
+    let json = serde_json::to_string_pretty(&report).unwrap();
+    println!("JSON:\n{}", json);
+    println!("");
 
     let deserialized: DamageReport = serde_json::from_str(&json).unwrap();
     println!("Deserialized: {:?}", deserialized);
