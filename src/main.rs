@@ -15,6 +15,7 @@ struct GPSLocation {
     longitude: f64,
 }
 
+// Represents the status of a fix
 #[derive(Debug)]
 enum FixStatus {
     Pending,
