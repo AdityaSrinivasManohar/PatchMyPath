@@ -45,11 +45,10 @@ See [PLAN.md](./PLAN.md) for the full step-by-step build plan, including what ge
 - [x] JSON serialisation/deserialisation working
 - [x] **Step 0** — Cargo workspace (`shared`, `backend`, `frontend` crates)
 - [x] **Step 1** — Axum REST API with in-memory storage
+- [x] **Step 2** — Leptos frontend skeleton (WASM, renders in browser)
 
 ### What's next
 
-- [ ] **Step 2** — Axum REST API with in-memory storage
-- [ ] **Step 2** — Leptos frontend skeleton (WASM, renders in browser)
 - [ ] **Step 3** — Interactive map with click-to-pin
 - [ ] **Step 4** — Report submission form (full round-trip to backend)
 - [ ] **Step 5** — Show all reports as map markers
