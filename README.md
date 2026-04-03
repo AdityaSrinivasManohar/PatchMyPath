@@ -44,10 +44,11 @@ See [PLAN.md](./PLAN.md) for the full step-by-step build plan, including what ge
 - [x] Domain types defined (`DamageReport`, `DamageType`, `GPSLocation`, `FixStatus`)
 - [x] JSON serialisation/deserialisation working
 - [x] **Step 0** — Cargo workspace (`shared`, `backend`, `frontend` crates)
+- [x] **Step 1** — Axum REST API with in-memory storage
 
 ### What's next
 
-- [ ] **Step 1** — Axum REST API with in-memory storage
+- [ ] **Step 2** — Axum REST API with in-memory storage
 - [ ] **Step 2** — Leptos frontend skeleton (WASM, renders in browser)
 - [ ] **Step 3** — Interactive map with click-to-pin
 - [ ] **Step 4** — Report submission form (full round-trip to backend)
