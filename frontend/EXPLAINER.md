@@ -53,12 +53,8 @@ autobins = false
 crate-type = ["cdylib", "rlib"]
 ```
 
-This tells Cargo what kind of output to produce when building the `frontend` lib:
-
-- **`cdylib`** — "C dynamic library". This is what produces the `.wasm` file. Despite the name being C-related, this is the correct type for WASM output. It means "build a shared library for FFI (foreign function interface)", and WASM is treated as a foreign target.
-- **`rlib`** — "Rust library". The normal Rust format, kept so other Rust crates could depend on `frontend` if needed. Mostly here for completeness.
-
-Without `crate-type = ["cdylib"]`, Rust would produce a `.rlib` that Trunk can't turn into WASM.
+- **`cdylib`** — produces the `.wasm` file. Despite the C-related name, this is the correct type for WASM output — it means "build a shared library for FFI", and WASM is treated as a foreign target.
+- **`rlib`** — the normal Rust library format, kept so other Rust crates could depend on `frontend` if needed.
 
 ```toml
 [dependencies]
@@ -66,12 +62,28 @@ shared = { path = "../shared" }
 leptos = { version = "0.8", features = ["csr"] }
 leptos-leaflet = "0.10"
 wasm-bindgen = "0.2"
+gloo-net = "0.6"
+serde_json = "1.0.149"
 ```
 
-- **`shared`** — our own domain types. The frontend will use `DamageReport` and `CreateReportRequest` when talking to the backend.
-- **`leptos`** with `csr` feature — Leptos is the Rust UI framework. CSR = **client-side rendering**: the entire app runs in the browser. The alternative (SSR) would run on the server and send HTML. We want CSR because map interaction has to happen in the browser. Note: `leptos-leaflet` must use the same version of `leptos` — a version mismatch causes a compile error because the `Component` trait from two different versions is incompatible.
-- **`leptos-leaflet`** — Rust components (`MapContainer`, `TileLayer`, `Marker`, etc.) that wrap Leaflet.js via `wasm_bindgen`. You write Rust, Leaflet does the map rendering in JS under the hood.
-- **`wasm-bindgen`** — the glue between Rust and the browser's JavaScript environment. Lets Rust call browser APIs (DOM, fetch, events) and lets JS call Rust functions. The `#[wasm_bindgen(start)]` attribute in `lib.rs` comes from this crate.
+- **`shared`** — our own domain types (`CreateReportRequest`, `DamageType`, `GPSLocation`). Shared between backend and frontend so the same types are used on both sides of the wire.
+- **`leptos`** with `csr` feature — the Rust UI framework. CSR = client-side rendering: the entire app runs in the browser. Must match the version used by `leptos-leaflet` — a version mismatch causes a compile error because the `Component` trait from two different versions of `leptos` is incompatible.
+- **`leptos-leaflet`** — Rust components (`MapContainer`, `TileLayer`, etc.) wrapping Leaflet.js. You write Rust, Leaflet renders the map in JS under the hood.
+- **`wasm-bindgen`** — the glue between Rust and the browser's JS environment. Lets Rust call browser APIs and lets JS call Rust functions. The `#[wasm_bindgen(start)]` attribute comes from this crate.
+- **`gloo-net`** — a safe wrapper around the browser's `fetch()` API for making HTTP requests from WASM. Without it you'd have to call raw JS `fetch` through `wasm_bindgen` yourself.
+- **`serde_json`** — serializes `CreateReportRequest` into a JSON string to send in the POST body.
+
+---
+
+## `Trunk.toml`
+
+```toml
+[[proxy]]
+rewrite = "/api/"
+backend = "http://localhost:3000/api/"
+```
+
+The frontend runs on `localhost:8080` and the backend on `localhost:3000`. Without a proxy, a `POST /api/reports` from the browser would go to `localhost:8080/api/reports` (the frontend server), not the backend. This config tells Trunk to forward any request matching `/api/` to `localhost:3000/api/` instead. No CORS issues in development — the browser only ever talks to one origin.
 
 ---
 
@@ -92,28 +104,34 @@ wasm-bindgen = "0.2"
 </html>
 ```
 
-**There is no `<script>` tag for your WASM.** Trunk detects this file, compiles your Rust to WASM, and *injects* the script tag automatically at build time. If you look at the built output (`dist/index.html`) you'll see it added.
+**No `<script>` tag for WASM** — Trunk injects it automatically at build time.
 
-**`<body></body>` is empty.** Leptos's `mount_to_body()` call in `lib.rs` inserts the rendered HTML into the body at runtime. The browser starts with an empty body and Rust fills it in.
+**Empty `<body>`** — Leptos's `mount_to_body()` fills it in at runtime.
 
-**Leaflet CSS + JS from CDN.** Leaflet is a JavaScript mapping library. We load it here so it's available when `leptos-leaflet` components initialise. This is the only JavaScript in the project, and we didn't write it.
+**Leaflet from CDN** — the only JavaScript in the project. Required by `leptos-leaflet` to do the actual map rendering.
 
-**The CSS reset** (`margin: 0; padding: 0`) removes the browser's default body margin so the map fills the screen edge to edge.
+**CSS reset** — removes browser default margins so the map fills the screen edge to edge.
 
 ---
 
 ## `src/lib.rs`
 
-This is the entire frontend application. Here's the current file in full:
+This is the entire frontend application. Here's the full file:
 
 ```rust
+use gloo_net::http::Request;
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
+use shared::{CreateReportRequest, DamageType, GPSLocation};
 use wasm_bindgen::prelude::*;
 
 #[component]
 fn App() -> impl IntoView {
     let clicked_pos: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+    let damage_type = RwSignal::new("Pothole".to_string());
+    let severity = RwSignal::new(5u8);
+    let description = RwSignal::new(String::new());
 
     let map_events = MapEvents::new().mouse_click(move |e| {
         let latlng = e.lat_lng();
@@ -132,10 +150,74 @@ fn App() -> impl IntoView {
                 attribution="&copy; OpenStreetMap contributors"
             />
         </MapContainer>
-        <div style="position: fixed; bottom: 1rem; left: 1rem; background: white; padding: 0.5rem; border-radius: 4px; z-index: 1000;">
+
+        <div style="position: fixed; bottom: 1rem; left: 1rem; background: white; padding: 1rem; border-radius: 4px; z-index: 1000; min-width: 260px;">
             {move || match clicked_pos.get() {
-                None => "Click the map to drop a pin".to_string(),
-                Some((lat, lng)) => format!("Lat: {:.5}, Lng: {:.5}", lat, lng),
+                None => view! {
+                    <p>"Click the map to drop a pin"</p>
+                }.into_any(),
+                Some((lat, lng)) => view! {
+                    <p style="margin-bottom: 0.5rem;">{format!("Lat: {:.5}, Lng: {:.5}", lat, lng)}</p>
+
+                    <label>"Type"</label>
+                    <select
+                        style="display: block; width: 100%; margin-bottom: 0.5rem;"
+                        on:change=move |e| damage_type.set(event_target_value(&e))
+                    >
+                        <option value="Pothole">"Pothole"</option>
+                        <option value="CracksOnRoad">"Cracks on Road"</option>
+                        <option value="WaterLeak">"Water Leak"</option>
+                    </select>
+
+                    <label>{move || format!("Severity: {}", severity.get())}</label>
+                    <input
+                        type="range" min="1" max="10"
+                        style="display: block; width: 100%; margin-bottom: 0.5rem;"
+                        prop:value=move || severity.get().to_string()
+                        on:input=move |e| {
+                            if let Ok(v) = event_target_value(&e).parse::<u8>() {
+                                severity.set(v);
+                            }
+                        }
+                    />
+
+                    <label>"Description"</label>
+                    <textarea
+                        style="display: block; width: 100%; margin-bottom: 0.5rem;"
+                        on:input=move |e| description.set(event_target_value(&e))
+                        prop:value=move || description.get()
+                    />
+
+                    <button on:click=move |_| {
+                        let req = CreateReportRequest {
+                            damage_type: match damage_type.get().as_str() {
+                                "CracksOnRoad" => DamageType::CracksOnRoad,
+                                "WaterLeak" => DamageType::WaterLeak,
+                                _ => DamageType::Pothole,
+                            },
+                            location: GPSLocation { latitude: lat, longitude: lng },
+                            severity: severity.get(),
+                            description: description.get(),
+                            image: None,
+                        };
+                        spawn_local(async move {
+                            let result = Request::post("/api/reports")
+                                .header("Content-Type", "application/json")
+                                .body(serde_json::to_string(&req).unwrap())
+                                .unwrap()
+                                .send()
+                                .await;
+                            if let Ok(resp) = result {
+                                if resp.ok() {
+                                    clicked_pos.set(None);
+                                    damage_type.set("Pothole".to_string());
+                                    severity.set(5);
+                                    description.set(String::new());
+                                }
+                            }
+                        });
+                    }>"Submit"</button>
+                }.into_any(),
             }}
         </div>
     }
@@ -150,37 +232,30 @@ pub fn main() {
 ### Imports
 
 ```rust
+use gloo_net::http::Request;
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
+use shared::{CreateReportRequest, DamageType, GPSLocation};
 use wasm_bindgen::prelude::*;
 ```
 
-The `::prelude::*` pattern brings in each crate's most commonly used items so you don't have to import each one individually.
+`spawn_local` is imported explicitly from `leptos::task` — it's not included in the prelude. Everything else comes in via `prelude::*`.
 
-### `#[component]` and `impl IntoView`
-
-```rust
-#[component]
-fn App() -> impl IntoView {
-```
-
-**`#[component]`** is a Leptos procedural macro that transforms this function into a reusable UI component. Under the hood it generates the wiring Leptos needs to track this component in its reactive system.
-
-**`-> impl IntoView`** — the return type. `IntoView` means "something that can be rendered to the DOM". You don't return a specific named type — you return "whatever the `view!` macro produces". The `impl` keyword means "some concrete type that implements this trait, the compiler figures out which".
-
-### `RwSignal` — reactive state
+### Reactive state
 
 ```rust
 let clicked_pos: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+let damage_type = RwSignal::new("Pothole".to_string());
+let severity = RwSignal::new(5u8);
+let description = RwSignal::new(String::new());
 ```
 
-`RwSignal<T>` is Leptos's reactive state primitive — similar to `useState` in React. It has two sides:
-- **Read** — calling `.get()` inside a `move ||` closure re-runs that closure automatically whenever the signal changes
-- **Write** — calling `.set(value)` updates the value and triggers any dependent views to re-render
+All four signals are declared at the top of `App`. Every piece of state the UI depends on lives here. `RwSignal<T>` is Leptos's reactive state primitive — calling `.set()` on a signal automatically re-renders any part of the `view!` that reads it via `.get()`.
 
-`Option<(f64, f64)>` models "no pin yet" (`None`) or "a pin at these coordinates" (`Some((lat, lng))`).
+`clicked_pos` is `Option<(f64, f64)>` — `None` when no pin has been dropped, `Some((lat, lng))` after a click. This drives the conditional rendering: `None` shows the placeholder text, `Some` shows the form.
 
-### The click handler
+### Click handler
 
 ```rust
 let map_events = MapEvents::new().mouse_click(move |e| {
@@ -189,46 +264,88 @@ let map_events = MapEvents::new().mouse_click(move |e| {
 });
 ```
 
-`MapEvents` is a builder struct — you call `.mouse_click(callback)` to attach a handler, then pass the whole thing to `MapContainer`. When the user clicks the map, Leaflet fires the callback with a `MouseEvent`. `.lat_lng()` extracts the geographic coordinates from that event.
-
-The `move` keyword captures `clicked_pos` by value into the closure. This is required because the closure crosses the WASM boundary — it must own everything it uses since it can't borrow from a scope that might be gone when the callback fires.
+`MapEvents` is a builder — `.mouse_click(callback)` attaches a handler and returns the same `MapEvents` so you can chain more events. The callback receives a `MouseEvent` from Leaflet; `.lat_lng()` extracts the geographic coordinates. The `move` keyword is required because this closure crosses the WASM boundary and must own everything it captures.
 
 ### The map
 
 ```rust
-<MapContainer
-    style="height: 100vh; width: 100%;"
-    center=Position::new(51.505, -0.09)
-    zoom=13.0
-    events=map_events
->
-    <TileLayer
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        attribution="&copy; OpenStreetMap contributors"
-    />
+<MapContainer style="height: 100vh; width: 100%;" center=... zoom=13.0 events=map_events>
+    <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="..." />
 </MapContainer>
 ```
 
-**`view!`** is a macro that lets you write HTML-like syntax directly in Rust. It's not real HTML and it's not JSX — it expands into Leptos's internal DOM representation at compile time. String literals inside `view!` must be quoted (`"text"`) because unquoted text would be invalid Rust.
+`MapContainer` creates the Leaflet map and provides a context for child components. `TileLayer` attaches itself to that context and loads OpenStreetMap imagery. The `height: 100vh` is required — Leaflet won't render into a zero-height div.
 
-**`MapContainer`** creates the Leaflet map instance and provides a context that child components (like `TileLayer`) use to attach themselves to the map. **`height: 100vh`** is required — without an explicit height, the map div is 0px tall and renders blank. This is a Leaflet requirement, not a Rust one.
-
-**`TileLayer`** fetches and renders the map imagery from OpenStreetMap. The `{s}`, `{z}`, `{x}`, `{y}` placeholders are filled in by Leaflet at runtime.
-
-### Reactive coordinate display
+### Conditional form rendering
 
 ```rust
-<div style="... z-index: 1000;">
-    {move || match clicked_pos.get() {
-        None => "Click the map to drop a pin".to_string(),
-        Some((lat, lng)) => format!("Lat: {:.5}, Lng: {:.5}", lat, lng),
-    }}
-</div>
+{move || match clicked_pos.get() {
+    None => view! { <p>"Click the map to drop a pin"</p> }.into_any(),
+    Some((lat, lng)) => view! { ... }.into_any(),
+}}
 ```
 
-The `move ||` closure is a reactive block — Leptos tracks that it reads `clicked_pos`, so whenever `.set()` is called on the signal, this closure re-runs and the text in the DOM updates automatically. No manual DOM manipulation needed.
+The `move ||` closure is a reactive block — Leptos re-runs it whenever `clicked_pos` changes. The two `match` arms return different view types, so `.into_any()` erases the concrete type to make them compatible. `lat` and `lng` are captured from the `Some` pattern and used directly inside the form (in the submit handler's `GPSLocation` construction).
 
-**`z-index: 1000`** is required because Leaflet manages its own z-index stack for map layers, controls, and popups. Without it, the div renders behind the map and is invisible even though it's in the DOM.
+### Controlled inputs
+
+```rust
+on:change=move |e| damage_type.set(event_target_value(&e))
+```
+
+```rust
+prop:value=move || severity.get().to_string()
+on:input=move |e| {
+    if let Ok(v) = event_target_value(&e).parse::<u8>() {
+        severity.set(v);
+    }
+}
+```
+
+- **`on:change` / `on:input`** — Leptos event listeners. `event_target_value(&e)` is a Leptos helper that pulls the current string value out of the event target element.
+- **`prop:value`** — sets the DOM *property* (not the HTML attribute). For inputs, `property` is the live value; `attribute` is the initial value. Using `prop:` keeps the input in sync with the signal in both directions.
+
+### The submit handler
+
+```rust
+<button on:click=move |_| {
+    let req = CreateReportRequest {
+        damage_type: match damage_type.get().as_str() {
+            "CracksOnRoad" => DamageType::CracksOnRoad,
+            "WaterLeak" => DamageType::WaterLeak,
+            _ => DamageType::Pothole,
+        },
+        location: GPSLocation { latitude: lat, longitude: lng },
+        severity: severity.get(),
+        description: description.get(),
+        image: None,
+    };
+    spawn_local(async move {
+        let result = Request::post("/api/reports")
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&req).unwrap())
+            .unwrap()
+            .send()
+            .await;
+        if let Ok(resp) = result {
+            if resp.ok() {
+                clicked_pos.set(None);
+                damage_type.set("Pothole".to_string());
+                severity.set(5);
+                description.set(String::new());
+            }
+        }
+    });
+}>"Submit"</button>
+```
+
+**Building `CreateReportRequest`** — the `damage_type` signal holds a string (because HTML `<select>` values are strings), so we `match` it back to the `DamageType` enum. `lat` and `lng` come from the enclosing `Some((lat, lng))` pattern. The server fills in `timestamp` and `status` — we don't send those.
+
+**`spawn_local`** — runs an async block from within a sync event handler. WASM is single-threaded, so you can't use `tokio::spawn`. `spawn_local` schedules the future on the same thread using the browser's microtask queue.
+
+**`Request::post(...).body(...).unwrap().send().await`** — `.body()` returns a `Result` (it can fail if the body can't be set), so we `.unwrap()` before calling `.send()`. `.send()` is async and returns a `Result<Response, Error>`.
+
+**`resp.ok()`** — true if the HTTP status is 200–299. On success, all four signals are reset to their defaults, which triggers Leptos to re-render: `clicked_pos` becomes `None`, the form disappears, and the placeholder text returns.
 
 ### Entry point
 
@@ -239,11 +356,7 @@ pub fn main() {
 }
 ```
 
-**`#[wasm_bindgen(start)]`** marks this as the WASM entry point. When the browser loads the `.wasm` module, the JS glue code automatically calls this function. Without it, the function exists in the binary but nothing calls it — the page stays blank.
-
-**`pub`** is required so wasm-bindgen can export it. A private function can't be called from outside the WASM module.
-
-**`mount_to_body(App)`** takes the `App` component (passing the function itself, not calling it — `App` not `App()`) and mounts it into the `<body>` of the HTML document.
+`#[wasm_bindgen(start)]` marks this as the WASM entry point — the browser calls it automatically when the `.wasm` module loads. `pub` is required so wasm-bindgen can export it. `mount_to_body(App)` mounts the component into `<body>`.
 
 ---
 
@@ -253,7 +366,7 @@ pub fn main() {
 fn main() {}
 ```
 
-An empty stub. The workspace's `cargo build` scans all member crates, and without a `main.rs` certain tooling expects a binary entry point. It does nothing — Trunk ignores it because of `autobins = false`, and the real entry point is in `lib.rs`.
+An empty stub. Without it, certain Cargo tooling expects a binary entry point. Trunk ignores it because of `autobins = false` — the real entry point is in `lib.rs`.
 
 ---
 
@@ -261,34 +374,37 @@ An empty stub. The workspace's `cargo build` scans all member crates, and withou
 
 ```
 Cargo.toml
-  ├── autobins = false          → ignore src/main.rs as a binary
-  ├── crate-type = ["cdylib"]   → produce a .wasm file
-  └── leptos + leptos-leaflet   → must share the same leptos version
+  ├── autobins = false           → ignore src/main.rs as a binary
+  ├── crate-type = ["cdylib"]    → produce a .wasm file
+  └── leptos + leptos-leaflet    → must share the same leptos version
+
+Trunk.toml
+  └── proxy /api/ → localhost:3000  → forward API calls to the backend
 
 index.html
-  ├── Leaflet CSS + JS from CDN → map rendering
-  └── Trunk injects WASM script → your Rust code
+  ├── Leaflet CSS + JS from CDN  → map rendering
+  └── Trunk injects WASM script  → your Rust code
 
 src/lib.rs
-  ├── RwSignal<Option<(f64,f64)>>  → reactive state for clicked pin
-  ├── MapEvents click handler      → updates signal on map click
-  ├── MapContainer + TileLayer     → renders the map
-  ├── reactive move || closure     → re-renders coordinates on signal change
-  └── #[wasm_bindgen(start)] main  → browser entry point
+  ├── 4x RwSignal                → all reactive state (pin, form fields)
+  ├── MapEvents click handler    → sets clicked_pos on map click
+  ├── MapContainer + TileLayer   → renders the map
+  ├── move || match clicked_pos  → conditional: placeholder or form
+  ├── controlled inputs          → on:input + prop:value keep signals in sync
+  ├── spawn_local + gloo-net     → async POST to /api/reports
+  ├── reset signals on success   → clears form and pin after submit
+  └── #[wasm_bindgen(start)]     → browser entry point
 ```
 
-| Concept | Where | What it means |
-|---|---|---|
-| `wasm32-unknown-unknown` | compile target | compile Rust to WebAssembly for the browser |
-| `crate-type = ["cdylib"]` | `Cargo.toml` | produce a `.wasm` binary instead of a native binary |
-| `#[wasm_bindgen(start)]` | `lib.rs` | marks the WASM entry point the browser calls on load |
-| `#[component]` | `lib.rs` | Leptos macro that makes a function into a UI component |
-| `view!` | `lib.rs` | macro for writing HTML-like syntax in Rust |
-| `mount_to_body` | `lib.rs` | mounts the root component into the HTML `<body>` |
-| `RwSignal<T>` | `lib.rs` | reactive state — reads trigger re-renders, writes update the value |
-| `Option<T>` in signals | `clicked_pos` | represents "nothing selected yet" vs "something selected" |
-| `MapEvents` builder | `lib.rs` | attaches event callbacks to the Leaflet map |
-| `move` closures | click handler | closure takes ownership because it may outlive the current scope |
-| `move ||` in `view!` | coordinate display | reactive closure — re-runs when signals it reads change |
-| `autobins = false` | `Cargo.toml` | stops Cargo treating `main.rs` as a binary target |
-| z-index | CSS on div | required to appear above Leaflet's internal layer stack |
+| Concept | What it means |
+|---|---|
+| `RwSignal<T>` | Reactive state — `.set()` triggers re-renders of anything that calls `.get()` |
+| `Option<T>` in signals | Models "nothing yet" vs "something" — drives conditional rendering |
+| `move` closures | Required when a closure crosses the WASM boundary or outlives its scope |
+| `move \|\|` in `view!` | Reactive closure — re-runs automatically when signals it reads change |
+| `.into_any()` | Erases concrete view types so different `match` arms are compatible |
+| `on:input` / `on:change` | Leptos event listeners; `event_target_value(&e)` extracts the value |
+| `prop:value` | Sets the live DOM property (not HTML attribute) to keep inputs controlled |
+| `spawn_local` | Runs async code from a sync context in single-threaded WASM |
+| `resp.ok()` | True if HTTP status is 200–299 |
+| z-index: 1000 | Required to render above Leaflet's internal layer stack |
