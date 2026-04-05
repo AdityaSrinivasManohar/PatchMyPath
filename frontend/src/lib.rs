@@ -7,12 +7,34 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+/// Sits inside MapContainer (has context access). Watches the fly_to signal
+/// and calls map.fly_to_with_zoom when it's set.
 #[component]
-fn LocationButton() -> impl IntoView {
-    let map_context = use_leaflet_context();
+fn FlyToHandler(fly_to: RwSignal<Option<(f64, f64)>>) -> impl IntoView {
+    let ctx = use_leaflet_context();
+    Effect::new(move |_| {
+        if let Some((lat, lng)) = fly_to.get() {
+            if let Some(ref ctx) = ctx {
+                if let Some(map) = ctx.map() {
+                    let latlng = leaflet::LatLng::new(lat, lng);
+                    let options = web_sys::js_sys::Object::new();
+                    let _ = web_sys::js_sys::Reflect::set(&options, &"duration".into(), &JsValue::from_f64(3.0));
+                    leaflet::Map::fly_to_with_zoom_and_options(&map, &latlng, 15.0, &options);
+                }
+            }
+        }
+    });
+    view! {}
+}
 
+/// Sits outside MapContainer (renders correctly as a fixed button).
+/// On click: gets geolocation, sets user_location marker and triggers fly_to.
+#[component]
+fn LocationButton(
+    fly_to: RwSignal<Option<(f64, f64)>>,
+    user_location: RwSignal<Option<(f64, f64)>>,
+) -> impl IntoView {
     let on_click = move |_| {
-        let Some(ctx) = map_context else { return };
         let window = web_sys::window().unwrap();
         let geo = window.navigator().geolocation().unwrap();
 
@@ -20,10 +42,8 @@ fn LocationButton() -> impl IntoView {
             let coords = pos.coords();
             let lat = coords.latitude();
             let lng = coords.longitude();
-            if let Some(map) = ctx.map_untracked() {
-                let latlng = leaflet::LatLng::new(lat, lng);
-                leaflet::Map::fly_to_with_zoom(&map, &latlng, 15.0);
-            }
+            user_location.set(Some((lat, lng)));
+            fly_to.set(Some((lat, lng)));
         });
 
         let _ = geo.get_current_position(success.as_ref().unchecked_ref());
@@ -45,6 +65,8 @@ fn App() -> impl IntoView {
     let description = RwSignal::new(String::new());
     let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
     let submitting = RwSignal::new(false);
+    let fly_to: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+    let user_location: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
 
     spawn_local(async move {
         if let Ok(resp) = Request::get("/api/reports").send().await {
@@ -53,6 +75,21 @@ fn App() -> impl IntoView {
             }
         }
     });
+
+    // Auto-locate on startup
+    if let Some(window) = web_sys::window() {
+        if let Ok(geo) = window.navigator().geolocation() {
+            let success = Closure::once(move |pos: web_sys::Position| {
+                let coords = pos.coords();
+                let lat = coords.latitude();
+                let lng = coords.longitude();
+                user_location.set(Some((lat, lng)));
+                fly_to.set(Some((lat, lng)));
+            });
+            let _ = geo.get_current_position(success.as_ref().unchecked_ref());
+            success.forget();
+        }
+    }
 
     window_event_listener(leptos::ev::keydown, move |e| {
         if e.key() == "Escape" {
@@ -68,15 +105,15 @@ fn App() -> impl IntoView {
     view! {
         <MapContainer
             style="height: 100vh; width: 100%;"
-            center=Position::new(51.505, -0.09)
-            zoom=13.0
+            center=Position::new(39.5, -98.35)
+            zoom=4.0
             events=map_events
         >
             <TileLayer
                 url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
                 attribution="&copy; OpenStreetMap contributors &copy; CARTO"
             />
-            <LocationButton />
+            <FlyToHandler fly_to=fly_to />
             <For
                 each=move || reports.get()
                 key=|r| format!("{:.6},{:.6}", r.location.latitude, r.location.longitude)
@@ -89,7 +126,12 @@ fn App() -> impl IntoView {
                     </Marker>
                 }
             />
+            {move || user_location.get().map(|(lat, lng)| view! {
+                <Marker position=Position::new(lat, lng) icon_class="user-dot" />
+            })}
         </MapContainer>
+
+        <LocationButton fly_to=fly_to user_location=user_location />
 
         <div class="panel">
             {move || match clicked_pos.get() {
