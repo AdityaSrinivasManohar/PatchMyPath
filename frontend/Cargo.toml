@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 shared = { path = "../shared" }
 leptos = { version = "0.8", features = ["csr"] }
+leptos_router = { version = "0.8" }
 leptos-leaflet = "0.10"
 wasm-bindgen = "0.2"
 gloo-net = "0.6"

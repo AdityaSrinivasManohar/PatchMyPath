@@ -37,11 +37,18 @@ pub struct CreateReportRequest {
 // Represents a damage report
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DamageReport {
+    pub id: i64,
     pub damage_type: DamageType,
     pub location: GPSLocation,
     pub severity: u8,
     pub description: String,
     pub image: Option<String>,
     pub timestamp: DateTime<Utc>,
+    pub status: FixStatus,
+}
+
+// Body sent by admin when updating a report's fix status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateStatusRequest {
     pub status: FixStatus,
 }

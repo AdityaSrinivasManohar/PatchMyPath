@@ -50,9 +50,9 @@ See [PLAN.md](./PLAN.md) for the full step-by-step build plan, including what ge
 - [x] **Step 4** — Report submission form (full round-trip to backend)
 - [x] **Step 5** — Show all reports as map markers
 - [x] **Step 6** — SQLite persistence
+- [x] **Step 7** — Update gui, support for current location
 
 ### What's next
-- [ ] **Step 7** — Update gui
-- [ ] **Step 8** — Image upload support
-- [ ] **Step 9** — Admin panel with status updates
+- [ ] **Step 8** — Admin panel with status updates
+- [ ] **Step 9** — Image upload support
 - [ ] **Step 10** - Railway deployment

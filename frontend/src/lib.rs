@@ -2,7 +2,9 @@ use gloo_net::http::Request;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
-use shared::{CreateReportRequest, DamageReport, DamageType, GPSLocation};
+use leptos_router::components::{Route, Router, Routes};
+use leptos_router::path;
+use shared::{CreateReportRequest, DamageReport, DamageType, FixStatus, GPSLocation, UpdateStatusRequest};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -58,7 +60,184 @@ fn LocationButton(
 }
 
 #[component]
-fn App() -> impl IntoView {
+fn AdminPanel(token: String) -> impl IntoView {
+    let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
+
+    spawn_local(async move {
+        if let Ok(resp) = Request::get("/api/reports").send().await {
+            if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
+                reports.set(data);
+            }
+        }
+    });
+
+    view! {
+        <div class="admin-panel">
+            <div class="admin-panel-header">
+                <h1 class="admin-title">"Reports"</h1>
+                <a href="/" class="admin-back">"← Back to map"</a>
+            </div>
+            <table class="admin-table">
+                <thead>
+                    <tr>
+                        <th>"Type"</th>
+                        <th>"Location"</th>
+                        <th>"Severity"</th>
+                        <th>"Description"</th>
+                        <th>"Reported"</th>
+                        <th>"Status"</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <For
+                        each=move || reports.get()
+                        key=|r| r.id
+                        children=move |r| {
+                            let token_s = token.clone();
+                            let token_d = token.clone();
+                            let report_id = r.id;
+                            let current_status = match r.status {
+                                FixStatus::InProgress => "InProgress",
+                                FixStatus::Completed  => "Completed",
+                                FixStatus::Pending    => "Pending",
+                            };
+                            view! {
+                                <tr>
+                                    <td>{format!("{:?}", r.damage_type)}</td>
+                                    <td class="coords">
+                                        {format!("{:.4}, {:.4}", r.location.latitude, r.location.longitude)}
+                                    </td>
+                                    <td>{r.severity}</td>
+                                    <td>{r.description.clone()}</td>
+                                    <td class="coords">{r.timestamp.format("%Y-%m-%d").to_string()}</td>
+                                    <td>
+                                        <select
+                                            class="input"
+                                            prop:value=current_status
+                                            on:change=move |e| {
+                                                let t = token_s.clone();
+                                                let status_str = event_target_value(&e);
+                                                spawn_local(async move {
+                                                    let status = match status_str.as_str() {
+                                                        "InProgress" => FixStatus::InProgress,
+                                                        "Completed"  => FixStatus::Completed,
+                                                        _            => FixStatus::Pending,
+                                                    };
+                                                    let body = serde_json::to_string(
+                                                        &UpdateStatusRequest { status }
+                                                    ).unwrap();
+                                                    let _ = Request::patch(
+                                                        &format!("/api/reports/{}", report_id)
+                                                    )
+                                                    .header("Authorization", &format!("Bearer {}", t))
+                                                    .header("Content-Type", "application/json")
+                                                    .body(body)
+                                                    .unwrap()
+                                                    .send()
+                                                    .await;
+                                                });
+                                            }
+                                        >
+                                            <option value="Pending">"Pending"</option>
+                                            <option value="InProgress">"In Progress"</option>
+                                            <option value="Completed">"Completed"</option>
+                                        </select>
+                                    </td>
+                                    <td>
+                                        <button
+                                            class="btn btn-danger"
+                                            on:click=move |_| {
+                                                let t = token_d.clone();
+                                                spawn_local(async move {
+                                                    let result = Request::delete(
+                                                        &format!("/api/reports/{}", report_id)
+                                                    )
+                                                    .header("Authorization", &format!("Bearer {}", t))
+                                                    .send()
+                                                    .await;
+                                                    if let Ok(resp) = result {
+                                                        if resp.ok() || resp.status() == 204 {
+                                                            reports.update(|rs| {
+                                                                rs.retain(|r| r.id != report_id)
+                                                            });
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        >
+                                            "Delete"
+                                        </button>
+                                    </td>
+                                </tr>
+                            }
+                        }
+                    />
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
+#[component]
+fn AdminPage() -> impl IntoView {
+    let auth_token: RwSignal<Option<String>> = RwSignal::new(None);
+    let password_input = RwSignal::new(String::new());
+    let error: RwSignal<Option<String>> = RwSignal::new(None);
+    let checking = RwSignal::new(false);
+
+    let submit = move |e: leptos::ev::SubmitEvent| {
+        e.prevent_default();
+        let pw = password_input.get();
+        spawn_local(async move {
+            checking.set(true);
+            error.set(None);
+            let result = Request::get("/api/admin/ping")
+                .header("Authorization", &format!("Bearer {}", pw))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.ok() => auth_token.set(Some(pw)),
+                Ok(_) => error.set(Some("Wrong password.".to_string())),
+                Err(_) => error.set(Some("Could not reach server.".to_string())),
+            }
+            checking.set(false);
+        });
+    };
+
+    view! {
+        {move || match auth_token.get() {
+            None => view! {
+                <div class="admin-login">
+                    <h1 class="admin-title">"Admin Panel"</h1>
+                    <p class="admin-subtitle">"Enter your password to continue."</p>
+                    <form on:submit=submit>
+                        <input
+                            type="password"
+                            class="input"
+                            placeholder="Password"
+                            prop:value=move || password_input.get()
+                            on:input=move |e| password_input.set(event_target_value(&e))
+                        />
+                        {move || error.get().map(|msg| view! {
+                            <p class="admin-error">{msg}</p>
+                        })}
+                        <button type="submit" class="btn" prop:disabled=move || checking.get()>
+                            {move || if checking.get() { "Checking..." } else { "Login" }}
+                        </button>
+                    </form>
+                    <a href="/" class="admin-back">"← Back to map"</a>
+                </div>
+            }.into_any(),
+            Some(token) => view! {
+                <AdminPanel token=token />
+            }.into_any(),
+        }}
+    }
+}
+
+#[component]
+fn MapPage() -> impl IntoView {
     let clicked_pos: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
     let damage_type = RwSignal::new("Pothole".to_string());
     let severity = RwSignal::new(5u8);
@@ -215,6 +394,18 @@ fn App() -> impl IntoView {
                 }.into_any(),
             }}
         </div>
+    }
+}
+
+#[component]
+fn App() -> impl IntoView {
+    view! {
+        <Router>
+            <Routes fallback=|| "Page not found.">
+                <Route path=path!("/") view=MapPage />
+                <Route path=path!("/admin") view=AdminPage />
+            </Routes>
+        </Router>
     }
 }
 

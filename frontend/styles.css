@@ -126,6 +126,111 @@
   box-shadow: 0 0 0 2px #3b82f6, 0 2px 6px rgba(0, 0, 0, 0.3);
 }
 
+/* Admin login page */
+.admin-login {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: #f9fafb;
+  font-family: system-ui, sans-serif;
+}
+
+.admin-login .input,
+.admin-login .btn {
+  width: 320px;
+}
+
+.admin-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #111827;
+  margin-bottom: 0.5rem;
+}
+
+.admin-subtitle {
+  color: #6b7280;
+  font-size: 14px;
+  margin-bottom: 1.25rem;
+}
+
+.admin-error {
+  color: #ef4444;
+  font-size: 13px;
+  margin-bottom: 0.5rem;
+  width: 320px;
+}
+
+.admin-back {
+  margin-top: 1rem;
+  font-size: 13px;
+  color: #6366f1;
+  text-decoration: none;
+}
+
+.admin-back:hover {
+  text-decoration: underline;
+}
+
+/* Admin panel (logged-in state) */
+.admin-panel {
+  padding: 2rem;
+  font-family: system-ui, sans-serif;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.admin-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.admin-table th {
+  text-align: left;
+  padding: 8px 12px;
+  background: #f3f4f6;
+  font-weight: 600;
+  color: #374151;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.admin-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid #e5e7eb;
+  color: #374151;
+  vertical-align: middle;
+}
+
+.admin-table tr:hover td {
+  background: #f9fafb;
+}
+
+.admin-table .input {
+  margin-bottom: 0;
+  width: auto;
+}
+
+.btn-danger {
+  background: #ef4444;
+  padding: 4px 10px;
+  font-size: 12px;
+  width: auto;
+  margin-top: 0;
+}
+
+.btn-danger:hover {
+  background: #dc2626;
+}
+
 /* Leaflet popup overrides */
 .leaflet-popup-content {
   font-family: system-ui, sans-serif;
