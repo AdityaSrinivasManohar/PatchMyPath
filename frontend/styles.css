@@ -1,0 +1,134 @@
+.map {
+  height: 100vh;
+  width: 100%;
+}
+
+.panel {
+  position: fixed;
+  bottom: 1rem;
+  left: 1rem;
+  background: white;
+  padding: 1.25rem;
+  border-radius: 8px;
+  z-index: 1000;
+  min-width: 280px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+}
+
+.panel-hint {
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.coords {
+  font-size: 12px;
+  color: #6b7280;
+  margin-bottom: 0.75rem;
+}
+
+.label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #374151;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  margin-bottom: 0.75rem;
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: system-ui, sans-serif;
+  box-sizing: border-box;
+}
+
+.input:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+}
+
+.range {
+  display: block;
+  width: 100%;
+  margin-bottom: 0.75rem;
+  accent-color: #6366f1;
+}
+
+.btn {
+  width: 100%;
+  padding: 8px;
+  background: #6366f1;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 0.25rem;
+}
+
+.btn:hover {
+  background: #4f46e5;
+}
+
+.btn:disabled {
+  background: #a5b4fc;
+  cursor: not-allowed;
+}
+
+/* Location button */
+.loc-btn {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  width: 36px;
+  height: 36px;
+  background: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 18px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6366f1;
+}
+
+.loc-btn:hover {
+  background: #f5f3ff;
+}
+
+/* Custom marker */
+.marker-dot {
+  width: 14px;
+  height: 14px;
+  background: #6366f1;
+  border: 2px solid white;
+  border-radius: 50%;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* Leaflet popup overrides */
+.leaflet-popup-content {
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  min-width: 160px;
+}
+
+.leaflet-popup-content p {
+  margin: 0 0 4px 0;
+}
+
+.leaflet-popup-content p:first-child {
+  font-weight: 600;
+  color: #374151;
+}
