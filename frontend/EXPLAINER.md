@@ -66,12 +66,12 @@ gloo-net = "0.6"
 serde_json = "1.0.149"
 ```
 
-- **`shared`** — our own domain types (`CreateReportRequest`, `DamageType`, `GPSLocation`). Shared between backend and frontend so the same types are used on both sides of the wire.
+- **`shared`** — our own domain types (`CreateReportRequest`, `DamageReport`, `DamageType`, `GPSLocation`). Shared between backend and frontend so the same types are used on both sides of the wire.
 - **`leptos`** with `csr` feature — the Rust UI framework. CSR = client-side rendering: the entire app runs in the browser. Must match the version used by `leptos-leaflet` — a version mismatch causes a compile error because the `Component` trait from two different versions of `leptos` is incompatible.
-- **`leptos-leaflet`** — Rust components (`MapContainer`, `TileLayer`, etc.) wrapping Leaflet.js. You write Rust, Leaflet renders the map in JS under the hood.
+- **`leptos-leaflet`** — Rust components (`MapContainer`, `TileLayer`, `Marker`, `Popup`, etc.) wrapping Leaflet.js. You write Rust, Leaflet renders the map in JS under the hood.
 - **`wasm-bindgen`** — the glue between Rust and the browser's JS environment. Lets Rust call browser APIs and lets JS call Rust functions. The `#[wasm_bindgen(start)]` attribute comes from this crate.
 - **`gloo-net`** — a safe wrapper around the browser's `fetch()` API for making HTTP requests from WASM. Without it you'd have to call raw JS `fetch` through `wasm_bindgen` yourself.
-- **`serde_json`** — serializes `CreateReportRequest` into a JSON string to send in the POST body.
+- **`serde_json`** — serializes `CreateReportRequest` into a JSON string to send in the POST body, and deserializes the JSON array of reports returned by the backend.
 
 ---
 
@@ -83,7 +83,7 @@ rewrite = "/api/"
 backend = "http://localhost:3000/api/"
 ```
 
-The frontend runs on `localhost:8080` and the backend on `localhost:3000`. Without a proxy, a `POST /api/reports` from the browser would go to `localhost:8080/api/reports` (the frontend server), not the backend. This config tells Trunk to forward any request matching `/api/` to `localhost:3000/api/` instead. No CORS issues in development — the browser only ever talks to one origin.
+The frontend runs on `localhost:8080` and the backend on `localhost:3000`. Without a proxy, any request to `/api/reports` from the browser would go to `localhost:8080/api/reports` (the frontend server), not the backend. This config tells Trunk to forward any request matching `/api/` to `localhost:3000/api/` instead. No CORS issues in development — the browser only ever talks to one origin.
 
 ---
 
@@ -123,7 +123,7 @@ use gloo_net::http::Request;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
-use shared::{CreateReportRequest, DamageType, GPSLocation};
+use shared::{CreateReportRequest, DamageReport, DamageType, GPSLocation};
 use wasm_bindgen::prelude::*;
 
 #[component]
@@ -132,6 +132,15 @@ fn App() -> impl IntoView {
     let damage_type = RwSignal::new("Pothole".to_string());
     let severity = RwSignal::new(5u8);
     let description = RwSignal::new(String::new());
+    let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
+
+    spawn_local(async move {
+        if let Ok(resp) = Request::get("/api/reports").send().await {
+            if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
+                reports.set(data);
+            }
+        }
+    });
 
     let map_events = MapEvents::new().mouse_click(move |e| {
         let latlng = e.lat_lng();
@@ -148,6 +157,18 @@ fn App() -> impl IntoView {
             <TileLayer
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 attribution="&copy; OpenStreetMap contributors"
+            />
+            <For
+                each=move || reports.get()
+                key=|r| format!("{:.6},{:.6}", r.location.latitude, r.location.longitude)
+                children=|r| view! {
+                    <Marker position=Position::new(r.location.latitude, r.location.longitude)>
+                        <Popup>
+                            <p>{format!("{:?} — severity {}", r.damage_type, r.severity)}</p>
+                            <p>{r.description.clone()}</p>
+                        </Popup>
+                    </Marker>
+                }
             />
         </MapContainer>
 
@@ -213,6 +234,11 @@ fn App() -> impl IntoView {
                                     damage_type.set("Pothole".to_string());
                                     severity.set(5);
                                     description.set(String::new());
+                                    if let Ok(r) = Request::get("/api/reports").send().await {
+                                        if let Ok(data) = r.json::<Vec<DamageReport>>().await {
+                                            reports.set(data);
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -236,11 +262,11 @@ use gloo_net::http::Request;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
-use shared::{CreateReportRequest, DamageType, GPSLocation};
+use shared::{CreateReportRequest, DamageReport, DamageType, GPSLocation};
 use wasm_bindgen::prelude::*;
 ```
 
-`spawn_local` is imported explicitly from `leptos::task` — it's not included in the prelude. Everything else comes in via `prelude::*`.
+`spawn_local` is imported explicitly from `leptos::task` — it's not included in the prelude. `DamageReport` is imported alongside the other shared types so we can deserialize the list of reports returned by the GET endpoint. Everything else comes in via `prelude::*`.
 
 ### Reactive state
 
@@ -249,11 +275,30 @@ let clicked_pos: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
 let damage_type = RwSignal::new("Pothole".to_string());
 let severity = RwSignal::new(5u8);
 let description = RwSignal::new(String::new());
+let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
 ```
 
-All four signals are declared at the top of `App`. Every piece of state the UI depends on lives here. `RwSignal<T>` is Leptos's reactive state primitive — calling `.set()` on a signal automatically re-renders any part of the `view!` that reads it via `.get()`.
+All five signals are declared at the top of `App`. Every piece of state the UI depends on lives here. `RwSignal<T>` is Leptos's reactive state primitive — calling `.set()` on a signal automatically re-renders any part of the `view!` that reads it via `.get()`.
 
 `clicked_pos` is `Option<(f64, f64)>` — `None` when no pin has been dropped, `Some((lat, lng))` after a click. This drives the conditional rendering: `None` shows the placeholder text, `Some` shows the form.
+
+`reports` holds the live list of all submitted reports. It starts as an empty `Vec`, gets populated immediately on load via a `GET /api/reports` fetch, and is refreshed again after every successful submission so the map stays up to date.
+
+### Loading existing reports on mount
+
+```rust
+spawn_local(async move {
+    if let Ok(resp) = Request::get("/api/reports").send().await {
+        if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
+            reports.set(data);
+        }
+    }
+});
+```
+
+This runs immediately when the component mounts — not inside any event handler, just in the component body. `spawn_local` schedules the async block on the browser's microtask queue and returns immediately so rendering isn't blocked. When the fetch completes, `reports.set(data)` triggers a re-render of the marker list.
+
+`resp.json::<Vec<DamageReport>>()` deserializes the JSON array the backend returns. The type annotation inside the turbofish (`::<Vec<DamageReport>>`) tells `gloo-net` what to deserialize into. The `DamageReport` type comes from `shared`, so the same struct definition is used on both sides of the wire.
 
 ### Click handler
 
@@ -266,15 +311,35 @@ let map_events = MapEvents::new().mouse_click(move |e| {
 
 `MapEvents` is a builder — `.mouse_click(callback)` attaches a handler and returns the same `MapEvents` so you can chain more events. The callback receives a `MouseEvent` from Leaflet; `.lat_lng()` extracts the geographic coordinates. The `move` keyword is required because this closure crosses the WASM boundary and must own everything it captures.
 
-### The map
+### The map and markers
 
 ```rust
 <MapContainer style="height: 100vh; width: 100%;" center=... zoom=13.0 events=map_events>
     <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="..." />
+    <For
+        each=move || reports.get()
+        key=|r| format!("{:.6},{:.6}", r.location.latitude, r.location.longitude)
+        children=|r| view! {
+            <Marker position=Position::new(r.location.latitude, r.location.longitude)>
+                <Popup>
+                    <p>{format!("{:?} — severity {}", r.damage_type, r.severity)}</p>
+                    <p>{r.description.clone()}</p>
+                </Popup>
+            </Marker>
+        }
+    />
 </MapContainer>
 ```
 
 `MapContainer` creates the Leaflet map and provides a context for child components. `TileLayer` attaches itself to that context and loads OpenStreetMap imagery. The `height: 100vh` is required — Leaflet won't render into a zero-height div.
+
+`<For>` is Leptos's reactive list renderer. It's more efficient than a plain `.map()` inside the view — it diffs the list using the `key` field and only re-renders items that actually changed, rather than rebuilding every marker on every update.
+
+- `each=move || reports.get()` — reads the signal reactively. Whenever `reports` is updated (on load or after a submission), this re-evaluates and the marker list re-renders.
+- `key=|r| format!(...)` — a unique string per report used for diffing. We use the lat/lng coordinates as the key since each report has a distinct location.
+- `children=|r| view! { ... }` — for each report, renders a `<Marker>` at its location with a nested `<Popup>`. Clicking a marker on the map opens the popup showing damage type, severity, and description.
+
+`Position::new(lat, lng)` is required for the `Marker` position prop — it expects a `Position` struct from leptos-leaflet, not a raw tuple.
 
 ### Conditional form rendering
 
@@ -303,23 +368,13 @@ on:input=move |e| {
 ```
 
 - **`on:change` / `on:input`** — Leptos event listeners. `event_target_value(&e)` is a Leptos helper that pulls the current string value out of the event target element.
-- **`prop:value`** — sets the DOM *property* (not the HTML attribute). For inputs, `property` is the live value; `attribute` is the initial value. Using `prop:` keeps the input in sync with the signal in both directions.
+- **`prop:value`** — sets the DOM *property* (not the HTML attribute). For inputs, the property is the live value; the attribute is the initial value. Using `prop:` keeps the input in sync with the signal in both directions.
 
 ### The submit handler
 
 ```rust
 <button on:click=move |_| {
-    let req = CreateReportRequest {
-        damage_type: match damage_type.get().as_str() {
-            "CracksOnRoad" => DamageType::CracksOnRoad,
-            "WaterLeak" => DamageType::WaterLeak,
-            _ => DamageType::Pothole,
-        },
-        location: GPSLocation { latitude: lat, longitude: lng },
-        severity: severity.get(),
-        description: description.get(),
-        image: None,
-    };
+    let req = CreateReportRequest { ... };
     spawn_local(async move {
         let result = Request::post("/api/reports")
             .header("Content-Type", "application/json")
@@ -333,6 +388,11 @@ on:input=move |e| {
                 damage_type.set("Pothole".to_string());
                 severity.set(5);
                 description.set(String::new());
+                if let Ok(r) = Request::get("/api/reports").send().await {
+                    if let Ok(data) = r.json::<Vec<DamageReport>>().await {
+                        reports.set(data);
+                    }
+                }
             }
         }
     });
@@ -345,7 +405,7 @@ on:input=move |e| {
 
 **`Request::post(...).body(...).unwrap().send().await`** — `.body()` returns a `Result` (it can fail if the body can't be set), so we `.unwrap()` before calling `.send()`. `.send()` is async and returns a `Result<Response, Error>`.
 
-**`resp.ok()`** — true if the HTTP status is 200–299. On success, all four signals are reset to their defaults, which triggers Leptos to re-render: `clicked_pos` becomes `None`, the form disappears, and the placeholder text returns.
+**`resp.ok()`** — true if the HTTP status is 200–299. On success, the form signals are reset to their defaults (which closes the form and clears the pin), and then a fresh `GET /api/reports` is fired. When that returns, `reports.set(data)` updates the signal, which triggers the `<For>` loop to re-render — the new report's marker appears on the map immediately without a page reload.
 
 ### Entry point
 
@@ -386,13 +446,15 @@ index.html
   └── Trunk injects WASM script  → your Rust code
 
 src/lib.rs
-  ├── 4x RwSignal                → all reactive state (pin, form fields)
+  ├── 5x RwSignal                → pin position, form fields, and reports list
+  ├── spawn_local on mount       → GET /api/reports → populate reports signal
   ├── MapEvents click handler    → sets clicked_pos on map click
-  ├── MapContainer + TileLayer   → renders the map
+  ├── MapContainer + TileLayer   → renders the base map
+  ├── <For> over reports         → renders a <Marker> + <Popup> per report
   ├── move || match clicked_pos  → conditional: placeholder or form
   ├── controlled inputs          → on:input + prop:value keep signals in sync
   ├── spawn_local + gloo-net     → async POST to /api/reports
-  ├── reset signals on success   → clears form and pin after submit
+  ├── re-fetch reports on submit → GET /api/reports → update reports signal
   └── #[wasm_bindgen(start)]     → browser entry point
 ```
 
@@ -403,8 +465,31 @@ src/lib.rs
 | `move` closures | Required when a closure crosses the WASM boundary or outlives its scope |
 | `move \|\|` in `view!` | Reactive closure — re-runs automatically when signals it reads change |
 | `.into_any()` | Erases concrete view types so different `match` arms are compatible |
+| `<For>` | Reactive list renderer — diffs by key, only re-renders changed items |
 | `on:input` / `on:change` | Leptos event listeners; `event_target_value(&e)` extracts the value |
 | `prop:value` | Sets the live DOM property (not HTML attribute) to keep inputs controlled |
 | `spawn_local` | Runs async code from a sync context in single-threaded WASM |
+| `resp.json::<T>()` | Deserializes the response body into type `T` using serde |
 | `resp.ok()` | True if HTTP status is 200–299 |
-| z-index: 1000 | Required to render above Leaflet's internal layer stack |
+| `Position::new(lat, lng)` | Required for Marker position — leptos-leaflet doesn't accept raw tuples |
+| z-index: 1000 | Required to render the form panel above Leaflet's internal layer stack |
+
+---
+
+## Known limitations and future improvements
+
+### Re-fetching all reports after submission is inefficient
+
+After a successful POST, the app fires a second `GET /api/reports` to refresh the marker list. This works fine now but doesn't scale — with a large database it downloads every report just to add one new marker.
+
+**Better approach:** The POST response already returns the newly created report (the backend sends it back as `201 Created` with the report body). Instead of re-fetching the whole list, just append that single report to the signal:
+
+```rust
+if let Ok(new_report) = resp.json::<DamageReport>().await {
+    reports.update(|list| list.push(new_report));
+}
+```
+
+No second HTTP request needed. Fast regardless of how many reports exist in the database.
+
+**Even better for large datasets:** Only fetch reports within the current map viewport (bounding box query params on the GET endpoint), so the frontend never downloads reports the user can't see.
