@@ -2,7 +2,7 @@ use gloo_net::http::Request;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
-use shared::{CreateReportRequest, DamageType, GPSLocation};
+use shared::{CreateReportRequest, DamageReport, DamageType, GPSLocation};
 use wasm_bindgen::prelude::*;
 
 #[component]
@@ -11,6 +11,15 @@ fn App() -> impl IntoView {
     let damage_type = RwSignal::new("Pothole".to_string());
     let severity = RwSignal::new(5u8);
     let description = RwSignal::new(String::new());
+    let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
+
+    spawn_local(async move {
+        if let Ok(resp) = Request::get("/api/reports").send().await {
+            if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
+                reports.set(data);
+            }
+        }
+    });
 
     let map_events = MapEvents::new().mouse_click(move |e| {
         let latlng = e.lat_lng();
@@ -27,6 +36,18 @@ fn App() -> impl IntoView {
             <TileLayer
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 attribution="&copy; OpenStreetMap contributors"
+            />
+            <For
+                each=move || reports.get()
+                key=|r| format!("{:.6},{:.6}", r.location.latitude, r.location.longitude)
+                children=|r| view! {
+                    <Marker position=Position::new(r.location.latitude, r.location.longitude)>
+                        <Popup>
+                            <p>{format!("{:?} — severity {}", r.damage_type, r.severity)}</p>
+                            <p>{r.description.clone()}</p>
+                        </Popup>
+                    </Marker>
+                }
             />
         </MapContainer>
 
@@ -92,6 +113,11 @@ fn App() -> impl IntoView {
                                     damage_type.set("Pothole".to_string());
                                     severity.set(5);
                                     description.set(String::new());
+                                    if let Ok(r) = Request::get("/api/reports").send().await {
+                                        if let Ok(data) = r.json::<Vec<DamageReport>>().await {
+                                            reports.set(data);
+                                        }
+                                    }
                                 }
                             }
                         });
