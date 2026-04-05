@@ -21,8 +21,8 @@ fn FlyToHandler(fly_to: RwSignal<Option<(f64, f64)>>) -> impl IntoView {
                 if let Some(map) = ctx.map() {
                     let latlng = leaflet::LatLng::new(lat, lng);
                     let options = web_sys::js_sys::Object::new();
-                    let _ = web_sys::js_sys::Reflect::set(&options, &"duration".into(), &JsValue::from_f64(3.0));
-                    leaflet::Map::fly_to_with_zoom_and_options(&map, &latlng, 15.0, &options);
+                    let _ = web_sys::js_sys::Reflect::set(&options, &"duration".into(), &JsValue::from_f64(0.1));
+                    leaflet::Map::fly_to_with_zoom_and_options(&map, &latlng, 13.0, &options);
                 }
             }
         }
