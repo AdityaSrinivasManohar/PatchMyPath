@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="patchmypath.svg" alt="Patch My Path" width="220" />
+  <img src="patchmypath.svg" alt="Patch My Path" width="500" />
 </p>
-
-<h1 align="center">Patch My Path</h1>
 
 <p align="center">
   A community road-damage reporting tool. Click the map, describe the issue, submit. Built entirely in Rust.
