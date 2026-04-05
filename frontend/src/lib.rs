@@ -1,4 +1,5 @@
 use gloo_net::http::Request;
+use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_leaflet::prelude::*;
@@ -63,13 +64,22 @@ fn LocationButton(
 fn AdminPanel(token: String) -> impl IntoView {
     let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
 
+    let active = RwSignal::new(true);
+
     spawn_local(async move {
-        if let Ok(resp) = Request::get("/api/reports").send().await {
-            if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
-                reports.set(data);
+        loop {
+            if !active.get_untracked() { break; }
+            if let Ok(resp) = Request::get("/api/reports").send().await {
+                if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
+                    reports.set(data);
+                }
             }
+            if !active.get_untracked() { break; }
+            TimeoutFuture::new(5_000).await;
         }
     });
+
+    on_cleanup(move || active.set(false));
 
     view! {
         <div class="admin-panel">
