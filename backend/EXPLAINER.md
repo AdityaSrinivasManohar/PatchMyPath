@@ -10,11 +10,11 @@ A line-by-line walkthrough of `src/main.rs` for someone new to Rust.
 use std::sync::{Arc, Mutex};
 ```
 
-These two types solve a specific problem: **how do multiple requests share the same list of reports safely?**
+These two types solve a specific problem: **how do multiple requests share the same database connection safely?**
 
 - **`Mutex<T>`** — a "mutual exclusion" lock. Only one thread can access the data inside it at a time. Think of it like a bathroom with one key — you grab the key, do your business, return the key. No one else can enter while you hold it.
 
-- **`Arc<T>`** — "Atomically Reference Counted". This lets multiple parts of your program *share ownership* of the same value. Normally in Rust, one piece of code owns a value and others borrow it. But a web server handles many requests at the same time — you can't have one request "own" the report list. `Arc` lets everyone have a handle to the same data, and it automatically cleans up when the last handle is dropped.
+- **`Arc<T>`** — "Atomically Reference Counted". This lets multiple parts of your program *share ownership* of the same value. Normally in Rust, one piece of code owns a value and others borrow it. But a web server handles many requests at the same time — you can't have one request "own" the database connection. `Arc` lets everyone have a handle to the same data, and it automatically cleans up when the last handle is dropped.
 
 Together, `Arc<Mutex<T>>` is the standard Rust pattern for **shared mutable state across threads**: Arc for shared ownership, Mutex for safe mutation.
 
@@ -35,14 +35,22 @@ Pulling in the pieces of Axum we need:
 - `get`, `post` — tell the router which HTTP method a route responds to
 
 ```rust
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 ```
-For `Utc::now()` — gets the current timestamp when a report is created.
+
+`Utc::now()` gets the current timestamp when a report is created. `DateTime` is used when parsing timestamps back out of the database.
 
 ```rust
-use shared::{CreateReportRequest, DamageReport, FixStatus};
+use rusqlite::{Connection, params};
+```
+
+`Connection` is the SQLite database handle. `params!` is a macro for passing typed values into SQL queries safely (prevents SQL injection by binding values separately from the query string).
+
+```rust
+use shared::{CreateReportRequest, DamageReport, DamageType, FixStatus, GPSLocation};
 use tower_http::cors::CorsLayer;
 ```
+
 Our own domain types from the `shared` crate, and CORS middleware from `tower-http`.
 
 ---
@@ -50,15 +58,49 @@ Our own domain types from the `shared` crate, and CORS middleware from `tower-ht
 ## The state type alias
 
 ```rust
-type AppState = Arc<Mutex<Vec<DamageReport>>>;
+type AppState = Arc<Mutex<Connection>>;
 ```
 
-This just gives a shorter name to `Arc<Mutex<Vec<DamageReport>>>` so we don't have to type that everywhere.
+This gives a short name to `Arc<Mutex<Connection>>` so we don't have to write it out everywhere. Reading it inside-out:
+- `Connection` — the SQLite database handle (one connection shared by all requests)
+- `Mutex<...>` — wrap it so only one request can use it at a time (SQLite handles one writer at a time)
+- `Arc<...>` — wrap that so every request handler can hold a reference to the same connection
 
-Reading it inside-out:
-- `Vec<DamageReport>` — a growable list of reports (this is our "database" for now)
-- `Mutex<...>` — wrap it so only one request can modify it at a time
-- `Arc<...>` — wrap that so every request handler can hold a reference to the same list
+---
+
+## Setting up the database
+
+```rust
+fn init_db() -> Connection {
+    let conn = Connection::open("reports.db").unwrap();
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS reports (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            damage_type TEXT    NOT NULL,
+            latitude    REAL    NOT NULL,
+            longitude   REAL    NOT NULL,
+            severity    INTEGER NOT NULL,
+            description TEXT    NOT NULL,
+            image       TEXT,
+            timestamp   TEXT    NOT NULL,
+            status      TEXT    NOT NULL
+        );
+    ").unwrap();
+    conn
+}
+```
+
+`Connection::open("reports.db")` opens the SQLite file at that path — or creates it if it doesn't exist. This is how SQLite works: the whole database is a single file.
+
+`CREATE TABLE IF NOT EXISTS` is safe to run every startup. If the table already exists, it's a no-op. If it's a fresh database, it creates the table.
+
+A few things worth noting about the schema:
+- **Enums as TEXT** — SQLite has no enum type. `damage_type` and `status` are stored as their string names (`"Pothole"`, `"Pending"`, etc.) and parsed back into Rust enums when reading.
+- **`latitude`/`longitude` as REAL** — SQLite's floating-point type, maps directly to Rust's `f64`.
+- **`timestamp` as TEXT** — stored as an RFC3339 string (e.g. `"2024-01-15T10:30:00Z"`), parsed back into `DateTime<Utc>` on read.
+- **`image` as nullable TEXT** — `Option<String>` in Rust maps to a nullable column in SQLite.
+
+The function returns the `Connection` so `main` can store it in shared state.
 
 ---
 
@@ -66,18 +108,62 @@ Reading it inside-out:
 
 ```rust
 async fn list_reports(State(state): State<AppState>) -> Json<Vec<DamageReport>> {
-    let reports = state.lock().unwrap();
-    Json(reports.clone())
+    let conn = state.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT damage_type, latitude, longitude, severity, description, image, timestamp, status FROM reports"
+    ).unwrap();
+
+    let reports = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, u8>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+        ))
+    }).unwrap()
+    .filter_map(|r| r.ok())
+    .map(|(damage_type_str, lat, lng, severity, description, image, timestamp_str, status_str)| {
+        DamageReport {
+            damage_type: match damage_type_str.as_str() {
+                "CracksOnRoad" => DamageType::CracksOnRoad,
+                "WaterLeak"    => DamageType::WaterLeak,
+                _              => DamageType::Pothole,
+            },
+            location: GPSLocation { latitude: lat, longitude: lng },
+            severity,
+            description,
+            image,
+            timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
+                .unwrap()
+                .with_timezone(&Utc),
+            status: match status_str.as_str() {
+                "InProgress" => FixStatus::InProgress,
+                "Completed"  => FixStatus::Completed,
+                _            => FixStatus::Pending,
+            },
+        }
+    })
+    .collect();
+
+    Json(reports)
 }
 ```
 
-**`async fn`** — this function is asynchronous. It can pause and let other requests run while waiting for I/O (like a database query). Rust doesn't have a built-in async runtime — that's what Tokio provides.
+**`state.lock().unwrap()`** — acquires the Mutex lock, giving exclusive access to the `Connection`. The lock is released automatically when `conn` goes out of scope at the end of the function.
 
-**`State(state): State<AppState>`** — this is an *extractor*. Axum looks at the function's parameters to figure out what to inject. `State<AppState>` tells Axum: "give me the shared state". The `State(state)` part is *destructuring* — it unwraps the `State` wrapper so `state` is the `Arc<Mutex<Vec<DamageReport>>>` directly.
+**`conn.prepare(...)`** — compiles the SQL query. `prepare` returns a `Statement` that can be executed. It's slightly more efficient than running raw SQL directly for queries you run repeatedly.
 
-**`state.lock().unwrap()`** — acquires the Mutex lock. This gives you a `MutexGuard`, which acts like a reference to the `Vec` inside. `.unwrap()` handles the error case where the Mutex is "poisoned" (another thread panicked while holding the lock — rare in practice). The lock is automatically released when `reports` goes out of scope at the end of the function.
+**`query_map([], |row| { ... })`** — executes the query (the `[]` means no parameters) and applies a closure to each row, extracting typed values via `row.get::<_, T>(column_index)`. The double-underscore in `get::<_, T>` lets Rust infer the first type argument while we specify `T` explicitly. Each call returns `Result`, and the `?` operator propagates errors.
 
-**`Json(reports.clone())`** — clones the Vec out of the lock (we can't return a reference to data behind a Mutex — the lock would need to stay held forever), then wraps it in `Json` which tells Axum to serialize it to JSON and set `Content-Type: application/json`.
+**`.filter_map(|r| r.ok())`** — skips any rows that failed to parse rather than crashing the whole request.
+
+**`.map(|...| DamageReport { ... })`** — converts each raw tuple of column values back into a `DamageReport`, parsing the string columns back into their proper Rust types: enum variants for `damage_type` and `status`, and `DateTime::parse_from_rfc3339` for the timestamp.
+
+**`.collect()`** — gathers the iterator into a `Vec<DamageReport>`.
 
 ---
 
@@ -90,9 +176,9 @@ async fn create_report(
 ) -> (StatusCode, Json<DamageReport>) {
 ```
 
-Two extractors this time:
-- `State(state)` — same as before, gives us the shared report list
-- `Json(req): Json<CreateReportRequest>` — Axum reads the request body, parses it as JSON into a `CreateReportRequest`, and hands it to us as `req`. If the body is malformed, Axum automatically returns a `400 Bad Request` before your function even runs.
+Two extractors:
+- `State(state)` — gives us the shared database connection
+- `Json(req): Json<CreateReportRequest>` — Axum reads the request body, parses it as JSON into a `CreateReportRequest`, and hands it to us as `req`. If the body is malformed, Axum automatically returns `400 Bad Request` before your function even runs.
 
 The return type `(StatusCode, Json<DamageReport>)` is a tuple — Axum understands this as "send this status code with this JSON body". This is how you return `201 Created` instead of the default `200 OK`.
 
@@ -103,21 +189,34 @@ The return type `(StatusCode, Json<DamageReport>)` is a tuple — Axum understan
         severity: req.severity,
         description: req.description,
         image: req.image,
-        timestamp: Utc::now(),   // server sets this
-        status: FixStatus::Pending,  // server sets this
+        timestamp: Utc::now(),
+        status: FixStatus::Pending,
     };
 ```
 
-Build the full `DamageReport` from the request. The client only sent the user-supplied fields (`CreateReportRequest`). The server adds `timestamp` and `status` — the client shouldn't be trusted to set these.
+Build the full `DamageReport` from the request. The client only sent the user-supplied fields. The server adds `timestamp` and `status` — the client shouldn't be trusted to set these.
 
 ```rust
-    let mut reports = state.lock().unwrap();
-    reports.push(report.clone());
+    let conn = state.lock().unwrap();
+    conn.execute(
+        "INSERT INTO reports (damage_type, latitude, ...) VALUES (?1, ?2, ...)",
+        params![
+            format!("{:?}", report.damage_type),
+            report.location.latitude,
+            ...
+            report.timestamp.to_rfc3339(),
+            format!("{:?}", report.status),
+        ],
+    ).unwrap();
 
     (StatusCode::CREATED, Json(report))
 ```
 
-Lock the Mutex (note `mut` — we need a mutable lock guard to push), add the report, then return it. We `.clone()` before pushing because `push` takes ownership of `report`, and we still need `report` to return it. (We could also push first and return the clone, but this reads more naturally.)
+**`format!("{:?}", report.damage_type)`** — uses the `Debug` representation of the enum to get its string name (`"Pothole"`, `"CracksOnRoad"`, `"WaterLeak"`). This is what gets stored in the TEXT column and matched back on read.
+
+**`params![...]`** — the rusqlite macro for binding values to `?1`, `?2`, etc. placeholders. This is important: values are passed separately from the query string, so user input can never be interpreted as SQL (SQL injection prevention).
+
+**`report.timestamp.to_rfc3339()`** — serializes the timestamp to a standard string like `"2024-01-15T10:30:00Z"` for storage.
 
 ---
 
@@ -126,15 +225,15 @@ Lock the Mutex (note `mut` — we need a mutable lock guard to push), add the re
 ```rust
 #[tokio::main]
 async fn main() {
+    let conn = init_db();
+    let state: AppState = Arc::new(Mutex::new(conn));
+    ...
+}
 ```
 
-`#[tokio::main]` is a *procedural macro* — it rewrites your `async fn main()` into a regular `fn main()` that sets up the Tokio runtime and runs your async code inside it. Without this, Rust wouldn't know how to run async code at startup.
+`#[tokio::main]` is a *procedural macro* — it rewrites your `async fn main()` into a regular `fn main()` that sets up the Tokio async runtime and runs your code inside it.
 
-```rust
-    let state: AppState = Arc::new(Mutex::new(Vec::new()));
-```
-
-Create the shared state: an empty Vec, wrapped in a Mutex, wrapped in an Arc. This single value will be cloned (Arc clone = just incrementing a counter, not copying the data) and handed to every request handler.
+`init_db()` opens (or creates) `reports.db` and returns the connection. That connection is immediately wrapped in `Arc<Mutex<...>>` and registered as the router's state via `.with_state(state)`. Every handler that declares `State(state): State<AppState>` gets an `Arc` clone pointing at the same connection.
 
 ```rust
     let app = Router::new()
@@ -144,11 +243,10 @@ Create the shared state: an empty Vec, wrapped in a Mutex, wrapped in an Arc. Th
         .with_state(state);
 ```
 
-Build the router:
 - `GET /api/reports` → `list_reports`
 - `POST /api/reports` → `create_report`
-- `.layer(CorsLayer::permissive())` — add CORS middleware so the browser frontend (on port 8080) is allowed to call this server (on port 3000) during development
-- `.with_state(state)` — attach the shared state so Axum knows what to inject when a handler uses `State<AppState>`
+- `.layer(CorsLayer::permissive())` — CORS middleware so the browser frontend (port 8080) can call this server (port 3000) during development
+- `.with_state(state)` — attaches the shared state so Axum knows what to inject
 
 ```rust
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -156,7 +254,7 @@ Build the router:
     axum::serve(listener, app).await.unwrap();
 ```
 
-Open a TCP socket on port 3000 (`0.0.0.0` means "all network interfaces"), then hand it to Axum to start accepting connections. `.await` suspends until the server shuts down (which is never, in normal operation).
+Opens a TCP socket on port 3000 (`0.0.0.0` = all network interfaces) and hands it to Axum. `.await` suspends until the server shuts down.
 
 ---
 
@@ -171,10 +269,11 @@ HTTP request arrives
         │
         ▼
   Handler function
-  (Axum injects State, Json, etc. automatically)
+  (Axum injects State<Connection>, Json, etc. automatically)
         │
-        ├── locks Mutex to read/write Vec<DamageReport>
-        ├── builds response value
+        ├── locks Mutex to get exclusive access to Connection
+        ├── runs SQL query (SELECT or INSERT)
+        ├── maps rows ↔ DamageReport structs
         └── returns Json<T> or (StatusCode, Json<T>)
                 │
                 ▼
@@ -182,26 +281,27 @@ HTTP request arrives
         and sends HTTP response
 ```
 
-The key Rust ideas at work here:
 | Concept | Where | Why |
 |---|---|---|
 | `Arc<Mutex<T>>` | `AppState` | Safe shared mutable state across async tasks |
-| Ownership + Clone | `report.clone()` | Can't return a reference out of a Mutex; must own the data |
+| `rusqlite::Connection` | inside `AppState` | The SQLite database handle |
+| `params![...]` | INSERT query | Binds values safely, prevents SQL injection |
+| Enums as TEXT | `damage_type`, `status` columns | SQLite has no enum type; store and parse string names |
+| RFC3339 strings | `timestamp` column | Standard format for storing datetimes as text |
 | Extractors | `State(...)`, `Json(...)` | Axum reads function signatures to inject the right values |
 | `async/await` | everywhere | Non-blocking request handling without manual threads |
-| Destructuring | `State(state)`, `Json(req)` | Unwrap a wrapper type and bind the inner value in one step |
 
 ---
 
 ## Deep dive: `Arc<Mutex<T>>`
 
-### What is it? (The Google Doc analogy)
+### The Google Doc analogy
 
 **`Arc` — the shared link to the doc**
 
 `Arc` is like the **URL to a Google Doc**. Everyone gets their own copy of the URL, but they all point to the *same underlying document*. Sharing the URL is cheap — you're not copying the whole doc. When the last person closes their tab, the doc gets cleaned up automatically.
 
-In code terms: cloning an `Arc` just increments a counter. The actual `Vec<DamageReport>` inside exists once in memory.
+In code terms: cloning an `Arc` just increments a counter. The actual `Connection` inside exists once in memory.
 
 **`Mutex` — the "one editor at a time" rule**
 
@@ -215,47 +315,26 @@ That's a `Mutex`. When you call `.lock()`, you grab exclusive access. Everyone e
 Arc  = the shared URL (everyone holds a reference to the same thing)
 Mutex = the one-editor-at-a-time rule (safe to modify without chaos)
 
-Arc<Mutex<Vec<DamageReport>>>
- │       │        └── the actual data (the Google Doc content)
- │       └── only one request can modify it at a time
+Arc<Mutex<Connection>>
+ │       │        └── the SQLite database connection
+ │       └── only one request can use it at a time
  └── every request handler shares the same one
 ```
 
-**Why you need both:**
-- `Arc` alone — everyone shares it, but two requests writing at the same time corrupts data. Rust won't even compile this.
-- `Mutex` alone — safe access, but only one owner, so you can't share it across requests.
-- `Arc<Mutex<T>>` — shared *and* safe. The standard Rust solution.
-
----
-
 ### Why not just use a reference (`&`) instead?
 
-A reference in Rust has a *lifetime* — it's only valid as long as the thing it points to is alive. The compiler enforces this at compile time.
+A reference in Rust has a *lifetime* — it's only valid as long as the thing it points to is alive. In a web server, `main()` creates the connection and then calls `axum::serve(...)` which runs forever, spawning a new async task per request. Each task can outlive the scope where the connection was created — or at least the compiler can't *prove* it won't. So it rejects a `&Connection` here.
 
-```rust
-let reports = Vec::new();
-let r = &reports; // only valid while reports is alive
-```
+`Arc` sidesteps this entirely. The data lives on the heap and is owned jointly by everyone holding an Arc. There's no single parent scope the data is tied to.
 
-In a web server, `main()` creates the Vec and then calls `axum::serve(...)` which runs forever, spawning a new async task per request. Each task can outlive the scope where the Vec was created — or at least the compiler can't *prove* it won't. So it rejects a `&Vec` here.
+**What Arc looks like in memory:**
 
-**What Arc actually does in memory**
-
-Without Arc — one owner, one pointer, freed when the owner is dropped:
 ```
 stack (main)          heap
-┌──────────┐         ┌─────────────────────┐
-│  reports ├────────►│  Vec<DamageReport>  │
-└──────────┘         └─────────────────────┘
-```
-
-With Arc — data lives on the heap, shared via a reference count:
-```
-stack (main)          heap
-┌──────────┐         ┌───────────────────────────────┐
-│  arc1    ├────────►│  count: 3                     │
-└──────────┘         │  data: Vec<DamageReport> [...] │
-                     └───────────────────────────────┘
+┌──────────┐         ┌───────────────────────┐
+│  arc1    ├────────►│  count: 3             │
+└──────────┘         │  data: Connection     │
+                     └───────────────────────┘
 stack (request 1)           ▲
 ┌──────────┐                │
 │  arc2    ├────────────────┘
@@ -266,9 +345,7 @@ stack (request 2)           │
 └──────────┘
 ```
 
-Each `Arc::clone()` just increments the counter — no data is copied. When a task finishes and its Arc is dropped, the counter decrements. When it hits 0, the Vec is freed.
-
-The key difference from `&`: the Arc *owns* the data jointly with everyone else. There's no single parent scope the data is tied to. The compiler doesn't need to reason about lifetimes at all.
+Each `Arc::clone()` just increments the counter — no data is copied. When a task finishes and its Arc is dropped, the counter decrements. When it hits 0, the connection is closed and freed.
 
 | | `&T` | `Arc<T>` |
 |---|---|---|
@@ -277,5 +354,3 @@ The key difference from `&`: the Arc *owns* the data jointly with everyone else.
 | Cost of sharing | free (just a pointer) | cheap (increment a counter) |
 | Works across async tasks? | no — lifetime can't be proven | yes |
 | When is data freed? | when the owner is dropped | when the last Arc is dropped |
-
-`&` is a *borrow* — pointing at someone else's data. `Arc` is *shared ownership* — the data belongs to whoever holds an Arc, collectively.
