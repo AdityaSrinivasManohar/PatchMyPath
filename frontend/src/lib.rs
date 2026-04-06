@@ -351,6 +351,19 @@ fn MapPage() -> impl IntoView {
                             }
                         }
                     />
+                    <p class="severity-hint">{move || match severity.get() {
+                        1  => "Hairline crack, barely noticeable",
+                        2  => "Small surface crack, no immediate hazard",
+                        3  => "Noticeable cracking or minor roughness",
+                        4  => "Moderate damage, slight discomfort when driving",
+                        5  => "Clear pothole or significant cracking",
+                        6  => "Causes jarring, potential for flat tyres",
+                        7  => "Large pothole, risk of tyre or wheel damage",
+                        8  => "Serious hazard, difficult to avoid",
+                        9  => "Severe damage, high risk of vehicle damage",
+                        10 => "Extreme — caused or likely to damage a vehicle",
+                        _  => "",
+                    }}</p>
 
                     <label class="label">"Description"</label>
                     <textarea
