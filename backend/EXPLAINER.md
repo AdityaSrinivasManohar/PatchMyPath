@@ -1,173 +1,157 @@
 # How the backend works
 
-A line-by-line walkthrough of `src/main.rs` for someone new to Rust.
+A walkthrough of `backend/src/main.rs` for someone new to Rust web servers.
 
 ---
 
-## The imports
+## What the backend does
+
+The backend is a single binary that:
+
+1. Opens (or creates) a SQLite database file.
+2. Serves a REST API for road damage reports.
+3. In production, also serves the compiled frontend (HTML, WASM, CSS) as static files.
+
+Everything is configured via environment variables so the same binary works in both local dev and production.
+
+---
+
+## Imports
 
 ```rust
 use std::sync::{Arc, Mutex};
 ```
 
-These two types solve a specific problem: **how do multiple requests share the same database connection safely?**
+Two types that solve the same problem: **how do multiple concurrent requests safely share one database connection?**
 
-- **`Mutex<T>`** — a "mutual exclusion" lock. Only one thread can access the data inside it at a time. Think of it like a bathroom with one key — you grab the key, do your business, return the key. No one else can enter while you hold it.
+- **`Mutex<T>`** — a mutual exclusion lock. Only one thread can access the data inside it at a time. Everyone else waits. The lock releases automatically when the lock guard goes out of scope.
+- **`Arc<T>`** — "Atomically Reference Counted". Lets multiple parts of your program share ownership of the same value. Normally in Rust one piece of code owns a value. But a web server handles many requests at once — you can't have one request "own" the database. `Arc` lets everyone hold a handle to the same data, and the data is freed only when the last handle is dropped.
 
-- **`Arc<T>`** — "Atomically Reference Counted". This lets multiple parts of your program *share ownership* of the same value. Normally in Rust, one piece of code owns a value and others borrow it. But a web server handles many requests at the same time — you can't have one request "own" the database connection. `Arc` lets everyone have a handle to the same data, and it automatically cleans up when the last handle is dropped.
-
-Together, `Arc<Mutex<T>>` is the standard Rust pattern for **shared mutable state across threads**: Arc for shared ownership, Mutex for safe mutation.
+Together, `Arc<Mutex<T>>` is the standard Rust pattern for shared mutable state across threads.
 
 ```rust
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    routing::{delete, get, patch, post},
 };
 ```
 
-Pulling in the pieces of Axum we need:
-- `Router` — maps URL paths to handler functions
-- `Json` — wraps a value to serialize it as JSON (or deserialize incoming JSON)
-- `State` — an *extractor* that pulls the shared `AppState` out and hands it to your handler
-- `StatusCode` — HTTP status codes like `200 OK`, `201 Created`
-- `get`, `post` — tell the router which HTTP method a route responds to
-
-```rust
-use chrono::{DateTime, Utc};
-```
-
-`Utc::now()` gets the current timestamp when a report is created. `DateTime` is used when parsing timestamps back out of the database.
-
-```rust
-use rusqlite::{Connection, params};
-```
-
-`Connection` is the SQLite database handle. `params!` is a macro for passing typed values into SQL queries safely (prevents SQL injection by binding values separately from the query string).
-
-```rust
-use shared::{CreateReportRequest, DamageReport, DamageType, FixStatus, GPSLocation};
-use tower_http::cors::CorsLayer;
-```
-
-Our own domain types from the `shared` crate, and CORS middleware from `tower-http`.
+- **`Router`** — maps URL paths to handler functions.
+- **`Json`** — wraps a value to serialize it as JSON, or deserializes incoming JSON from a request body.
+- **`State`** — an extractor that pulls the shared `AppState` out of the router and injects it into a handler.
+- **`Path`** — extracts a path segment like `{id}` from the URL.
+- **`HeaderMap`** — gives access to request headers (used for reading the `Authorization` header).
+- **`StatusCode`** — HTTP status codes: `200 OK`, `201 Created`, `401 Unauthorized`, etc.
+- **`get`, `post`, `patch`, `delete`** — tell the router which HTTP method a route responds to.
 
 ---
 
-## The state type alias
+## `AppData` — shared state
 
 ```rust
-type AppState = Arc<Mutex<Connection>>;
+struct AppData {
+    db: Mutex<Connection>,
+    admin_password: String,
+}
+type AppState = Arc<AppData>;
 ```
 
-This gives a short name to `Arc<Mutex<Connection>>` so we don't have to write it out everywhere. Reading it inside-out:
-- `Connection` — the SQLite database handle (one connection shared by all requests)
-- `Mutex<...>` — wrap it so only one request can use it at a time (SQLite handles one writer at a time)
-- `Arc<...>` — wrap that so every request handler can hold a reference to the same connection
+All route handlers share one `AppData` via Axum's `State` extractor. Reading inside-out:
+
+- **`Connection`** — the rusqlite database handle (one connection for the whole server).
+- **`Mutex<Connection>`** — wraps it so only one request can run a query at a time. SQLite supports one writer at a time, so this is correct.
+- **`admin_password`** — the admin password, read from the `ADMIN_PASSWORD` environment variable at startup. Stored here so every handler can check it without re-reading the env var.
+- **`Arc<AppData>`** — wraps the whole struct so every request handler holds a reference to the same data. Cheap to clone (just increments a counter).
 
 ---
 
-## Setting up the database
+## `check_auth` — authentication helper
+
+```rust
+fn check_auth(headers: &HeaderMap, admin_password: &str) -> bool {
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| token == admin_password)
+        .unwrap_or(false)
+}
+```
+
+The admin frontend sends the password as an HTTP header on every protected request:
+
+```
+Authorization: Bearer <password>
+```
+
+This function extracts the token from that header and compares it to the stored password. Returns `true` if they match, `false` for anything else (missing header, wrong password, malformed header).
+
+**Why check on every request?** The frontend is WASM running in the browser — any user can inspect it. Secrets cannot be stored there. The backend must verify the password on every protected request, not just at login time. The `/api/admin/ping` endpoint exists purely as a login check: the frontend hits it to verify a password before showing the admin panel, without actually touching any data.
+
+---
+
+## Database setup
 
 ```rust
 fn init_db() -> Connection {
-    let conn = Connection::open("reports.db").unwrap();
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "reports.db".to_string());
+    let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS reports (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             damage_type TEXT    NOT NULL,
-            latitude    REAL    NOT NULL,
-            longitude   REAL    NOT NULL,
-            severity    INTEGER NOT NULL,
-            description TEXT    NOT NULL,
-            image       TEXT,
-            timestamp   TEXT    NOT NULL,
-            status      TEXT    NOT NULL
+            ...
         );
     ").unwrap();
     conn
 }
 ```
 
-`Connection::open("reports.db")` opens the SQLite file at that path — or creates it if it doesn't exist. This is how SQLite works: the whole database is a single file.
+`Connection::open` opens the SQLite file at `DB_PATH` — or creates it if it doesn't exist. This is how SQLite works: the whole database is a single file.
 
-`CREATE TABLE IF NOT EXISTS` is safe to run every startup. If the table already exists, it's a no-op. If it's a fresh database, it creates the table.
+`CREATE TABLE IF NOT EXISTS` is safe to run every startup. If the table already exists it's a no-op. If it's a fresh database it creates the table.
 
-A few things worth noting about the schema:
-- **Enums as TEXT** — SQLite has no enum type. `damage_type` and `status` are stored as their string names (`"Pothole"`, `"Pending"`, etc.) and parsed back into Rust enums when reading.
-- **`latitude`/`longitude` as REAL** — SQLite's floating-point type, maps directly to Rust's `f64`.
-- **`timestamp` as TEXT** — stored as an RFC3339 string (e.g. `"2024-01-15T10:30:00Z"`), parsed back into `DateTime<Utc>` on read.
-- **`image` as nullable TEXT** — `Option<String>` in Rust maps to a nullable column in SQLite.
+**Schema notes:**
 
-The function returns the `Connection` so `main` can store it in shared state.
+| Column | SQLite type | Rust type | Why |
+|---|---|---|---|
+| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | `i64` | Auto-assigned unique ID per row |
+| `damage_type` | `TEXT` | `DamageType` enum | SQLite has no enum type; stored as `"Pothole"`, `"CracksOnRoad"`, etc. |
+| `status` | `TEXT` | `FixStatus` enum | Same — stored as `"Pending"`, `"InProgress"`, `"Completed"` |
+| `latitude`/`longitude` | `REAL` | `f64` | SQLite floating-point maps directly to Rust `f64` |
+| `timestamp` | `TEXT` | `DateTime<Utc>` | Stored as RFC3339 string, e.g. `"2024-01-15T10:30:00Z"` |
+| `image` | `TEXT` (nullable) | `Option<String>` | `NULL` in SQLite maps to `None` in Rust |
 
 ---
 
-## The GET handler
+## Routes
+
+### `GET /api/reports` — list all reports
 
 ```rust
 async fn list_reports(State(state): State<AppState>) -> Json<Vec<DamageReport>> {
-    let conn = state.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT damage_type, latitude, longitude, severity, description, image, timestamp, status FROM reports"
-    ).unwrap();
-
-    let reports = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, f64>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, u8>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-        ))
-    }).unwrap()
-    .filter_map(|r| r.ok())
-    .map(|(damage_type_str, lat, lng, severity, description, image, timestamp_str, status_str)| {
-        DamageReport {
-            damage_type: match damage_type_str.as_str() {
-                "CracksOnRoad" => DamageType::CracksOnRoad,
-                "WaterLeak"    => DamageType::WaterLeak,
-                _              => DamageType::Pothole,
-            },
-            location: GPSLocation { latitude: lat, longitude: lng },
-            severity,
-            description,
-            image,
-            timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
-                .unwrap()
-                .with_timezone(&Utc),
-            status: match status_str.as_str() {
-                "InProgress" => FixStatus::InProgress,
-                "Completed"  => FixStatus::Completed,
-                _            => FixStatus::Pending,
-            },
-        }
-    })
-    .collect();
-
+    let conn = state.db.lock().unwrap();
+    let mut stmt = conn.prepare("SELECT id, damage_type, ... FROM reports").unwrap();
+    ...
     Json(reports)
 }
 ```
 
-**`state.lock().unwrap()`** — acquires the Mutex lock, giving exclusive access to the `Connection`. The lock is released automatically when `conn` goes out of scope at the end of the function.
+No auth required — reports are public.
 
-**`conn.prepare(...)`** — compiles the SQL query. `prepare` returns a `Statement` that can be executed. It's slightly more efficient than running raw SQL directly for queries you run repeatedly.
+**`state.db.lock().unwrap()`** — acquires the Mutex lock, giving exclusive access to the `Connection`. The lock releases automatically when `conn` drops at end of function.
 
-**`query_map([], |row| { ... })`** — executes the query (the `[]` means no parameters) and applies a closure to each row, extracting typed values via `row.get::<_, T>(column_index)`. The double-underscore in `get::<_, T>` lets Rust infer the first type argument while we specify `T` explicitly. Each call returns `Result`, and the `?` operator propagates errors.
+**`query_map([], |row| { ... })`** — executes the query (empty `[]` = no parameters) and applies a closure to each row. `row.get::<_, T>(index)` extracts a typed value from a column. The `?` propagates errors per row.
 
-**`.filter_map(|r| r.ok())`** — skips any rows that failed to parse rather than crashing the whole request.
+**`.filter_map(|r| r.ok())`** — skips malformed rows rather than crashing the whole request.
 
-**`.map(|...| DamageReport { ... })`** — converts each raw tuple of column values back into a `DamageReport`, parsing the string columns back into their proper Rust types: enum variants for `damage_type` and `status`, and `DateTime::parse_from_rfc3339` for the timestamp.
-
-**`.collect()`** — gathers the iterator into a `Vec<DamageReport>`.
+**`.map(|...| DamageReport { ... })`** — parses each raw tuple back into a `DamageReport`: string columns back to enums, the RFC3339 string back to `DateTime<Utc>`.
 
 ---
 
-## The POST handler
+### `POST /api/reports` — create a report
 
 ```rust
 async fn create_report(
@@ -176,165 +160,202 @@ async fn create_report(
 ) -> (StatusCode, Json<DamageReport>) {
 ```
 
+No auth required — anyone can submit a report.
+
 Two extractors:
-- `State(state)` — gives us the shared database connection
-- `Json(req): Json<CreateReportRequest>` — Axum reads the request body, parses it as JSON into a `CreateReportRequest`, and hands it to us as `req`. If the body is malformed, Axum automatically returns `400 Bad Request` before your function even runs.
+- **`State(state)`** — shared database connection.
+- **`Json(req)`** — Axum reads the request body, parses it as JSON into a `CreateReportRequest`, and hands it to us. If the body is malformed, Axum returns `400 Bad Request` before your function even runs.
 
-The return type `(StatusCode, Json<DamageReport>)` is a tuple — Axum understands this as "send this status code with this JSON body". This is how you return `201 Created` instead of the default `200 OK`.
+The return type `(StatusCode, Json<DamageReport>)` is a tuple — Axum serializes this as a response with the given status code and JSON body. This is how we return `201 Created` instead of the default `200 OK`.
 
-```rust
-    let report = DamageReport {
-        damage_type: req.damage_type,
-        location: req.location,
-        severity: req.severity,
-        description: req.description,
-        image: req.image,
-        timestamp: Utc::now(),
-        status: FixStatus::Pending,
-    };
-```
+**`format!("{:?}", req.damage_type)`** — uses the `Debug` representation of the enum to get its string name for storage. The same string is matched back to an enum variant when reading.
 
-Build the full `DamageReport` from the request. The client only sent the user-supplied fields. The server adds `timestamp` and `status` — the client shouldn't be trusted to set these.
+**`params![...]`** — rusqlite's macro for binding values to `?1`, `?2`, ... placeholders. Values are passed separately from the query string — user input can never be interpreted as SQL (prevents SQL injection).
 
-```rust
-    let conn = state.lock().unwrap();
-    conn.execute(
-        "INSERT INTO reports (damage_type, latitude, ...) VALUES (?1, ?2, ...)",
-        params![
-            format!("{:?}", report.damage_type),
-            report.location.latitude,
-            ...
-            report.timestamp.to_rfc3339(),
-            format!("{:?}", report.status),
-        ],
-    ).unwrap();
-
-    (StatusCode::CREATED, Json(report))
-```
-
-**`format!("{:?}", report.damage_type)`** — uses the `Debug` representation of the enum to get its string name (`"Pothole"`, `"CracksOnRoad"`, `"WaterLeak"`). This is what gets stored in the TEXT column and matched back on read.
-
-**`params![...]`** — the rusqlite macro for binding values to `?1`, `?2`, etc. placeholders. This is important: values are passed separately from the query string, so user input can never be interpreted as SQL (SQL injection prevention).
-
-**`report.timestamp.to_rfc3339()`** — serializes the timestamp to a standard string like `"2024-01-15T10:30:00Z"` for storage.
+**`conn.last_insert_rowid()`** — gets the auto-generated `id` for the row just inserted. This is sent back to the frontend in the response so it can reference the report later (e.g. in the admin panel).
 
 ---
 
-## The main function
+### `GET /api/admin/ping` — password check
+
+```rust
+async fn admin_ping(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+    if check_auth(&headers, &state.admin_password) {
+        StatusCode::OK
+    } else {
+        StatusCode::UNAUTHORIZED
+    }
+}
+```
+
+This endpoint exists purely for the login flow. The frontend sends the entered password here before showing the admin panel. A `200` means "proceed"; a `401` means "wrong password". No data is read or written.
+
+---
+
+### `PATCH /api/reports/{id}` — update status
+
+```rust
+async fn update_report_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateStatusRequest>,
+) -> StatusCode {
+    if !check_auth(&headers, &state.admin_password) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    ...
+    conn.execute("UPDATE reports SET status = ?1 WHERE id = ?2", params![...]);
+    StatusCode::OK
+}
+```
+
+Auth required. **`Path(id): Path<i64>`** extracts the `{id}` segment from the URL as an `i64`. **Note:** Axum 0.8 uses `{id}` in route strings, not `:id` — using `:id` causes a runtime panic at startup.
+
+---
+
+### `DELETE /api/reports/{id}` — delete a report
+
+```rust
+async fn delete_report(...) -> StatusCode {
+    if !check_auth(&headers, &state.admin_password) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    conn.execute("DELETE FROM reports WHERE id = ?1", params![id]);
+    StatusCode::NO_CONTENT
+}
+```
+
+Auth required. Returns `204 No Content` on success — the standard HTTP response for a successful deletion with no body.
+
+---
+
+## `main()` — wiring it all together
 
 ```rust
 #[tokio::main]
 async fn main() {
-    let conn = init_db();
-    let state: AppState = Arc::new(Mutex::new(conn));
-    ...
-}
-```
+    let admin_password = std::env::var("ADMIN_PASSWORD")
+        .unwrap_or_else(|_| "admin".to_string());
 
-`#[tokio::main]` is a *procedural macro* — it rewrites your `async fn main()` into a regular `fn main()` that sets up the Tokio async runtime and runs your code inside it.
+    let state: AppState = Arc::new(AppData {
+        db: Mutex::new(init_db()),
+        admin_password,
+    });
 
-`init_db()` opens (or creates) `reports.db` and returns the connection. That connection is immediately wrapped in `Arc<Mutex<...>>` and registered as the router's state via `.with_state(state)`. Every handler that declares `State(state): State<AppState>` gets an `Arc` clone pointing at the same connection.
+    let static_dir = std::env::var("STATIC_DIR")
+        .unwrap_or_else(|_| "frontend/dist".to_string());
+    let serve_dir = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(format!("{}/index.html", &static_dir)));
 
-```rust
     let app = Router::new()
         .route("/api/reports", get(list_reports))
         .route("/api/reports", post(create_report))
+        .route("/api/reports/{id}", patch(update_report_status))
+        .route("/api/reports/{id}", delete(delete_report))
+        .route("/api/admin/ping", get(admin_ping))
         .layer(CorsLayer::permissive())
-        .with_state(state);
-```
+        .with_state(state)
+        .fallback_service(serve_dir);
 
-- `GET /api/reports` → `list_reports`
-- `POST /api/reports` → `create_report`
-- `.layer(CorsLayer::permissive())` — CORS middleware so the browser frontend (port 8080) can call this server (port 3000) during development
-- `.with_state(state)` — attaches the shared state so Axum knows what to inject
-
-```rust
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Listening on http://localhost:3000");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
 ```
 
-Opens a TCP socket on port 3000 (`0.0.0.0` = all network interfaces) and hands it to Axum. `.await` suspends until the server shuts down.
+**`#[tokio::main]`** — a procedural macro that rewrites `async fn main()` into a regular `fn main()` that sets up the Tokio async runtime and runs your code inside it.
+
+**`ServeDir` + `.fallback_service`** — in production, any request that doesn't match an API route is served from the `frontend/dist/` folder. The `.not_found_service(ServeFile::new("index.html"))` fallback handles SPA routes like `/admin` that don't correspond to a real file — the browser receives `index.html` and Leptos's client-side router takes over.
+
+**`CorsLayer::permissive()`** — allows cross-origin requests. Needed in development when the frontend runs on port 8080 and the backend on port 3000. In production both are on the same origin so this is a no-op, but it's harmless to keep.
+
+**Environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | Port to bind to (Railway sets this automatically) |
+| `DB_PATH` | `reports.db` | Path to the SQLite file |
+| `STATIC_DIR` | `frontend/dist` | Where the compiled frontend lives |
+| `ADMIN_PASSWORD` | `admin` | Admin panel password |
 
 ---
 
-## The full picture
+## The full request flow
 
 ```
 HTTP request arrives
         │
         ▼
-    Router
-  (matches path + method)
+    CorsLayer (middleware)
         │
         ▼
-  Handler function
-  (Axum injects State<Connection>, Json, etc. automatically)
+    Router (matches path + method)
         │
-        ├── locks Mutex to get exclusive access to Connection
-        ├── runs SQL query (SELECT or INSERT)
-        ├── maps rows ↔ DamageReport structs
-        └── returns Json<T> or (StatusCode, Json<T>)
+        ├── /api/* route found
+        │       │
+        │       ▼
+        │   Handler function
+        │   Axum injects: State<AppData>, Path<i64>, Json<T>, HeaderMap
+        │       │
+        │       ├── check_auth (if protected route)
+        │       ├── state.db.lock() → exclusive SQLite access
+        │       ├── run SQL query (SELECT / INSERT / UPDATE / DELETE)
+        │       ├── map rows ↔ structs
+        │       └── return StatusCode or Json<T>
+        │
+        └── no /api/* match
                 │
                 ▼
-        Axum serializes to JSON
-        and sends HTTP response
+            ServeDir (static files from frontend/dist/)
+                │
+                ├── file exists → serve it (WASM, JS, CSS, images)
+                └── file missing → serve index.html (SPA fallback)
 ```
-
-| Concept | Where | Why |
-|---|---|---|
-| `Arc<Mutex<T>>` | `AppState` | Safe shared mutable state across async tasks |
-| `rusqlite::Connection` | inside `AppState` | The SQLite database handle |
-| `params![...]` | INSERT query | Binds values safely, prevents SQL injection |
-| Enums as TEXT | `damage_type`, `status` columns | SQLite has no enum type; store and parse string names |
-| RFC3339 strings | `timestamp` column | Standard format for storing datetimes as text |
-| Extractors | `State(...)`, `Json(...)` | Axum reads function signatures to inject the right values |
-| `async/await` | everywhere | Non-blocking request handling without manual threads |
 
 ---
 
-## Deep dive: `Arc<Mutex<T>>`
+## Deep dive: `Arc<AppData>`
 
 ### The Google Doc analogy
 
 **`Arc` — the shared link to the doc**
 
-`Arc` is like the **URL to a Google Doc**. Everyone gets their own copy of the URL, but they all point to the *same underlying document*. Sharing the URL is cheap — you're not copying the whole doc. When the last person closes their tab, the doc gets cleaned up automatically.
+`Arc` is like the URL to a Google Doc. Everyone gets their own copy of the URL, but they all point to the same underlying document. Sharing the URL is cheap — you're not copying the doc. When the last person closes their tab, the doc is cleaned up automatically.
 
-In code terms: cloning an `Arc` just increments a counter. The actual `Connection` inside exists once in memory.
+In code terms: cloning an `Arc` just increments a counter. The actual `AppData` (with the database connection inside) exists once in memory.
 
-**`Mutex` — the "one editor at a time" rule**
+**`Mutex` — one editor at a time**
 
-A Google Doc lets multiple people view it, but if two people edit the same sentence simultaneously you get chaos. So imagine a rule: **only one person can type at a time**. You click "Edit", make your changes, click "Done" — and the next person gets in.
+Imagine a rule: only one person can edit the document at once. You click "Edit", make your changes, click "Done" — the next person gets in.
 
-That's a `Mutex`. When you call `.lock()`, you grab exclusive access. Everyone else waits. When the lock guard goes out of scope (end of the function), it releases automatically.
+That's `Mutex`. When you call `.lock()`, you get exclusive access. Everyone else blocks. The lock releases automatically when the guard goes out of scope.
 
 **Together:**
 
 ```
-Arc  = the shared URL (everyone holds a reference to the same thing)
-Mutex = the one-editor-at-a-time rule (safe to modify without chaos)
+Arc      = the shared URL  (everyone holds a reference to the same AppData)
+Mutex    = one editor at a time  (safe to mutate without concurrent chaos)
 
-Arc<Mutex<Connection>>
- │       │        └── the SQLite database connection
- │       └── only one request can use it at a time
- └── every request handler shares the same one
+Arc<AppData>
+ │   └── AppData
+ │        ├── Mutex<Connection>  ← only one query runs at a time
+ │        └── admin_password     ← read-only, no lock needed
+ └── every request handler gets a clone of this Arc
 ```
 
 ### Why not just use a reference (`&`) instead?
 
-A reference in Rust has a *lifetime* — it's only valid as long as the thing it points to is alive. In a web server, `main()` creates the connection and then calls `axum::serve(...)` which runs forever, spawning a new async task per request. Each task can outlive the scope where the connection was created — or at least the compiler can't *prove* it won't. So it rejects a `&Connection` here.
+A Rust reference has a *lifetime* — it's only valid as long as the thing it points to is alive. In a web server, `main()` creates `AppData` and then calls `axum::serve(...)` which runs forever, spawning an async task per request. Each task could outlive the scope where `AppData` was created — or at least the compiler can't *prove* it won't. So it rejects `&AppData` here.
 
-`Arc` sidesteps this entirely. The data lives on the heap and is owned jointly by everyone holding an Arc. There's no single parent scope the data is tied to.
-
-**What Arc looks like in memory:**
+`Arc` sidesteps this entirely. The data lives on the heap and is jointly owned by all Arc holders. There's no single parent scope it's tied to.
 
 ```
 stack (main)          heap
-┌──────────┐         ┌───────────────────────┐
-│  arc1    ├────────►│  count: 3             │
-└──────────┘         │  data: Connection     │
-                     └───────────────────────┘
+┌──────────┐         ┌──────────────────────┐
+│  arc1    ├────────►│  count: 3            │
+└──────────┘         │  data: AppData       │
+                     └──────────────────────┘
 stack (request 1)           ▲
 ┌──────────┐                │
 │  arc2    ├────────────────┘
@@ -345,12 +366,12 @@ stack (request 2)           │
 └──────────┘
 ```
 
-Each `Arc::clone()` just increments the counter — no data is copied. When a task finishes and its Arc is dropped, the counter decrements. When it hits 0, the connection is closed and freed.
+Each `Arc::clone()` just increments the counter — no data is copied. When a task finishes, its Arc is dropped and the counter decrements. When it hits 0, `AppData` is freed.
 
 | | `&T` | `Arc<T>` |
 |---|---|---|
-| Where does data live? | somewhere with a known lifetime | heap, owned by the Arc itself |
-| How does compiler verify safety? | tracks lifetime statically | reference counting at runtime |
+| Where does data live? | somewhere with a known lifetime | heap, owned by the Arc |
+| How is safety verified? | statically, by the compiler | reference count at runtime |
 | Cost of sharing | free (just a pointer) | cheap (increment a counter) |
-| Works across async tasks? | no — lifetime can't be proven | yes |
+| Works across async tasks? | no | yes |
 | When is data freed? | when the owner is dropped | when the last Arc is dropped |

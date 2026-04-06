@@ -1,86 +1,191 @@
-# How the frontend works
+# How the app works
 
-A file-by-file walkthrough of the frontend crate for someone new to Rust and WebAssembly.
+A complete walkthrough of the Patch My Path codebase — frontend, backend, shared types, and deployment — for someone new to Rust web development.
 
 ---
 
 ## The big picture
 
-The backend is a native binary that runs on your machine and speaks HTTP. The frontend is something completely different — it compiles to **WebAssembly (WASM)**, a binary format that browsers can execute. There is no JavaScript written by hand. Rust becomes the browser code.
+The project is a Cargo **workspace** with three crates:
 
-The flow from code to browser:
+```
+patch_my_path/
+├── shared/     ← domain types used by both backend and frontend
+├── backend/    ← Axum HTTP server (native binary, runs on the server)
+└── frontend/   ← Leptos app (compiles to WebAssembly, runs in the browser)
+```
+
+There is no JavaScript written by hand. The entire browser UI is written in Rust, compiled to **WebAssembly (WASM)** — a binary format that browsers can execute natively.
+
+The request flow in production:
+
+```
+Browser
+  │
+  ├── GET /          → backend serves frontend/dist/index.html
+  ├── GET /*.wasm    → backend serves the compiled WASM bundle
+  └── POST /api/reports → backend handles the API request, reads/writes SQLite
+```
+
+In development, Trunk runs a local server on port 8080 and **proxies** `/api/` calls to the backend on port 3000, so you get live-reloading without CORS issues.
+
+---
+
+## `shared/` — the glue between backend and frontend
+
+Both the backend (native Rust) and the frontend (WASM Rust) import the same `shared` crate. This guarantees that the types the backend serializes are exactly the types the frontend deserializes — no mismatches possible.
+
+Key types:
+
+- **`DamageReport`** — a full report as stored in the database, including `id: i64` and `status: FixStatus`.
+- **`CreateReportRequest`** — what the frontend sends in a POST body (no `id` or `status` — the backend fills those in).
+- **`UpdateStatusRequest`** — what the frontend sends in a PATCH body to change a report's status.
+- **`DamageType`** — `Pothole`, `CracksOnRoad`, `WaterLeak`.
+- **`FixStatus`** — `Pending`, `InProgress`, `Completed`.
+- **`GPSLocation`** — `{ latitude: f64, longitude: f64 }`.
+
+All types derive `Serialize` and `Deserialize` from serde, so they work with JSON automatically.
+
+---
+
+## `backend/` — the Axum server
+
+### What it does
+
+The backend is a single binary that:
+
+1. Opens (or creates) a SQLite database file.
+2. Exposes a REST API for reports.
+3. **In production**, also serves the compiled frontend files as static assets.
+
+### Routes
+
+| Method | Path | Auth required | What it does |
+|---|---|---|---|
+| `GET` | `/api/reports` | No | Returns all reports as JSON |
+| `POST` | `/api/reports` | No | Creates a new report, returns it as `201 Created` |
+| `PATCH` | `/api/reports/{id}` | Yes | Updates a report's status |
+| `DELETE` | `/api/reports/{id}` | Yes | Deletes a report |
+| `GET` | `/api/admin/ping` | Yes | Returns 200 if the password is correct, 401 if not |
+| `*` | `/*` | No | Serves the frontend static files (WASM, JS, CSS, HTML) |
+
+### Authentication
+
+The admin password is stored in the `ADMIN_PASSWORD` environment variable (defaults to `"admin"` for local dev). It is **never sent to the browser** — the WASM bundle can be inspected by anyone, so keeping secrets in it is insecure.
+
+Instead, the frontend sends the password with every protected request as an HTTP header:
+
+```
+Authorization: Bearer <password>
+```
+
+The backend checks this on every protected route with a helper function:
+
+```rust
+fn check_auth(headers: &HeaderMap, admin_password: &str) -> bool {
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| token == admin_password)
+        .unwrap_or(false)
+}
+```
+
+The `/api/admin/ping` endpoint exists purely as a login check — the frontend hits it with the entered password; a 200 means "password correct, proceed to admin panel", a 401 means "wrong password".
+
+### AppState
+
+All route handlers share state via Axum's `State` extractor. The state type is:
+
+```rust
+struct AppData {
+    db: Mutex<Connection>,      // the SQLite connection
+    admin_password: String,     // read from ADMIN_PASSWORD env var
+}
+type AppState = Arc<AppData>;
+```
+
+`Arc` (atomic reference count) lets the state be shared across async tasks. `Mutex` ensures only one handler accesses the database at a time.
+
+### Static file serving
+
+In production the backend also serves the compiled frontend. `tower-http`'s `ServeDir` points at the `frontend/dist/` folder:
+
+```rust
+let serve_dir = ServeDir::new(&static_dir)
+    .not_found_service(ServeFile::new(format!("{}/index.html", &static_dir)));
+```
+
+The `.not_found_service` fallback means any route that isn't a real file (like `/admin`) gets served `index.html` — which is correct because Leptos's client-side router handles those routes in the browser.
+
+### Configurable via environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | Port to listen on (Railway sets this automatically) |
+| `DB_PATH` | `reports.db` | Path to the SQLite file |
+| `STATIC_DIR` | `frontend/dist` | Where the compiled frontend lives |
+| `ADMIN_PASSWORD` | `admin` | Admin panel password |
+
+---
+
+## `frontend/` — the Leptos WASM app
+
+### How Rust becomes browser code
 
 ```
 src/lib.rs  (Rust)
      │
      ▼
-trunk serve
+trunk build
      │
-     ├── compiles Rust → .wasm via cargo (targeting wasm32-unknown-unknown)
+     ├── compiles Rust → .wasm  (targeting wasm32-unknown-unknown)
      ├── runs wasm-bindgen to generate JS glue code
      ├── injects <script> tag into index.html
-     └── serves everything on localhost:8080
+     └── outputs everything into frontend/dist/
 
 Browser loads index.html
      │
      ├── downloads leaflet.css + leaflet.js from CDN
      ├── downloads styles.css
-     ├── downloads your .wasm file
-     └── JS glue calls your #[wasm_bindgen(start)] function
+     ├── downloads frontend.wasm
+     └── JS glue calls #[wasm_bindgen(start)]
               │
               ▼
          mount_to_body(App) runs
               │
               ▼
-         Leptos renders your component into <body>
+         Leptos renders the component tree into <body>
 ```
 
----
-
-## `Cargo.toml`
-
-```toml
-[package]
-name = "frontend"
-version = "0.1.0"
-edition = "2024"
-autobins = false
-```
-
-**`autobins = false`** — by default, Cargo treats any file at `src/main.rs` as a binary target. We have a `src/main.rs` stub (kept for workspace compatibility) but we don't want Cargo to build it as a binary. This flag disables that auto-detection so only the `[lib]` gets built.
+### `Cargo.toml`
 
 ```toml
 [lib]
 crate-type = ["cdylib", "rlib"]
 ```
 
-- **`cdylib`** — produces the `.wasm` file. Despite the C-related name, this is the correct type for WASM output — it means "build a shared library for FFI", and WASM is treated as a foreign target.
-- **`rlib`** — the normal Rust library format, kept so other Rust crates could depend on `frontend` if needed.
+- **`cdylib`** — produces the `.wasm` file. This is the correct type for WASM output — it tells Cargo to build a shared library for a foreign target.
+- **`rlib`** — the normal Rust library format, kept so the workspace can reference the crate if needed.
 
-```toml
-[dependencies]
-shared = { path = "../shared" }
-leptos = { version = "0.8", features = ["csr"] }
-leptos-leaflet = "0.10"
-wasm-bindgen = "0.2"
-gloo-net = "0.6"
-serde_json = "1.0.149"
-leaflet = "0.5"
-web-sys = { version = "0.3", features = ["Window", "Navigator", "Geolocation", "Position", "Coordinates"] }
-```
+`autobins = false` — prevents Cargo from treating `src/main.rs` (an empty stub) as a binary target.
 
-- **`shared`** — our own domain types (`CreateReportRequest`, `DamageReport`, `DamageType`, `GPSLocation`). Shared between backend and frontend so the same types are used on both sides of the wire.
-- **`leptos`** with `csr` feature — the Rust UI framework. CSR = client-side rendering: the entire app runs in the browser. Must match the version used by `leptos-leaflet` — a version mismatch causes a compile error because the `Component` trait from two different versions of `leptos` is incompatible.
-- **`leptos-leaflet`** — Rust components (`MapContainer`, `TileLayer`, `Marker`, `Popup`, etc.) wrapping Leaflet.js. You write Rust, Leaflet renders the map in JS under the hood.
-- **`wasm-bindgen`** — the glue between Rust and the browser's JS environment. Lets Rust call browser APIs and lets JS call Rust functions. The `#[wasm_bindgen(start)]` attribute and `Closure` type come from this crate.
-- **`gloo-net`** — a safe wrapper around the browser's `fetch()` API for making HTTP requests from WASM.
-- **`serde_json`** — serializes `CreateReportRequest` into a JSON string to send in the POST body.
-- **`leaflet`** — the typed Rust bindings for Leaflet's JavaScript classes (`LatLng`, `Map`). Used directly when calling imperative map methods like `fly_to_with_zoom_and_options`.
-- **`web-sys`** — Rust bindings for browser Web APIs. Each API you use must be listed as a feature flag in Cargo.toml — here we enable `Geolocation`, `Position`, `Coordinates`, etc. Without listing them, the types don't exist at compile time.
+Key dependencies:
 
----
+| Crate | What it does |
+|---|---|
+| `shared` | Domain types — same structs used on both sides of the wire |
+| `leptos` (csr) | The UI framework. CSR = client-side rendering, entire app runs in browser |
+| `leptos_router` | Client-side routing — maps URLs to components without page reloads |
+| `leptos-leaflet` | Rust components wrapping the Leaflet.js map library |
+| `gloo-net` | Safe wrapper around the browser's `fetch()` API |
+| `gloo-timers` (futures) | `TimeoutFuture` for async sleep without blocking the browser |
+| `wasm-bindgen` | Glue between Rust and the browser's JS environment |
+| `web-sys` | Rust bindings for browser APIs (Geolocation, etc.) |
+| `serde_json` | Serializes request structs to JSON strings |
 
-## `Trunk.toml`
+### `Trunk.toml`
 
 ```toml
 [[proxy]]
@@ -88,75 +193,119 @@ rewrite = "/api/"
 backend = "http://localhost:3000/api/"
 ```
 
-The frontend runs on `localhost:8080` and the backend on `localhost:3000`. Without a proxy, any request to `/api/reports` would go to the frontend server. This config tells Trunk to forward all `/api/` traffic to the backend. No CORS issues in development — the browser only ever talks to one origin.
+In development, Trunk runs on port 8080. Without the proxy, any `/api/` request would go to the wrong server. This config forwards all `/api/` traffic to the backend on port 3000. The browser only ever talks to one origin, so there are no CORS issues locally.
 
----
+In production, the proxy isn't used — the backend serves both the frontend files and the API from the same origin.
 
-## `index.html`
+### `index.html`
 
 ```html
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Patch My Path</title>
-    <style>* { margin: 0; padding: 0; box-sizing: border-box; }</style>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <link data-trunk rel="css" href="styles.css" />
-  </head>
-  <body></body>
-</html>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link data-trunk rel="css" href="styles.css" />
 ```
 
-**`data-trunk rel="css"`** — tells Trunk to copy `styles.css` into the build output and inject it. Without the `data-trunk` attribute, Trunk ignores the file and the browser never receives it.
-
-**No `<script>` tag for WASM** — Trunk injects it automatically at build time.
-
-**Empty `<body>`** — Leptos's `mount_to_body()` fills it in at runtime.
-
-**Leaflet from CDN** — the only JavaScript in the project. Required by `leptos-leaflet` to do the actual map rendering.
+- Leaflet CSS and JS come from a CDN — the only JavaScript in the project. `leptos-leaflet` wraps it, but the underlying map rendering is still Leaflet.js.
+- **`data-trunk rel="css"`** tells Trunk to copy `styles.css` into the build output and inject it. Without this attribute Trunk ignores the file.
+- **No `<script>` for WASM** — Trunk injects it automatically.
+- **Empty `<body>`** — Leptos fills it at runtime.
 
 ---
 
-## `styles.css`
+## `src/lib.rs` — component by component
 
-All visual styles live here. No inline `style=` attributes appear in `lib.rs` — every element uses a CSS class instead. The key classes:
+The entire frontend application lives in this one file. It defines five components and a WASM entry point.
 
-- **`.panel`** — the fixed bottom-left card: white background, rounded corners, drop shadow.
-- **`.input`** — shared by `<select>` and `<textarea>`: border, padding, focus ring in indigo.
-- **`.range`** — the severity slider with `accent-color: #6366f1` to tint the thumb and track indigo.
-- **`.btn`** — indigo submit button with hover (darker indigo) and disabled (faded indigo) states.
-- **`.loc-btn`** — the fixed bottom-right location button: small white square, indigo icon, hover tint.
-- **`.marker-dot`** — custom report marker: small indigo circle with a white border.
-- **`.user-dot`** — current location marker: blue circle with a white border and a blue outer ring, visually distinct from report markers.
-- **`.leaflet-popup-content`** — overrides Leaflet's default popup typography with `system-ui` font and cleaner spacing.
+### Component tree
 
----
+```
+App (router wrapper)
+ ├── Route "/"      → MapPage
+ │    ├── MapContainer
+ │    │    ├── TileLayer
+ │    │    ├── FlyToHandler
+ │    │    ├── <For> over reports → Marker + Popup per report
+ │    │    └── user location Marker (conditional)
+ │    ├── LocationButton (outside MapContainer)
+ │    └── .panel div (form, outside MapContainer)
+ │
+ └── Route "/admin" → AdminPage
+      ├── (password not entered) → login form
+      └── (password entered)    → AdminPanel
+           └── <For> over reports → table row per report
+```
 
-## `src/lib.rs`
-
-This is the entire frontend application. It defines three components: `FlyToHandler`, `LocationButton`, and `App`.
-
-### Imports
+### `App` — the router
 
 ```rust
-use gloo_net::http::Request;
-use leptos::prelude::*;
-use leptos::task::spawn_local;
-use leptos_leaflet::prelude::*;
-use shared::{CreateReportRequest, DamageReport, DamageType, GPSLocation};
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
+#[component]
+fn App() -> impl IntoView {
+    view! {
+        <Router>
+            <Routes fallback=|| "Page not found.">
+                <Route path=path!("/") view=MapPage />
+                <Route path=path!("/admin") view=AdminPage />
+            </Routes>
+        </Router>
+    }
+}
 ```
 
-`spawn_local` is imported explicitly from `leptos::task` — it's not in the prelude. `Closure` is from `wasm_bindgen::closure` and is used to pass Rust callbacks to JavaScript APIs. `JsCast` provides the `.unchecked_ref::<T>()` method for casting JS values to specific types.
+`leptos_router` handles client-side navigation. When the user visits `/admin`, the browser doesn't make a new HTTP request — Leptos swaps the component. This is why the backend's static file fallback must serve `index.html` for unknown paths: any deep-link needs to load the app first, then Leptos handles the route.
 
 ---
 
-### `FlyToHandler` component
+### `MapPage` — the public map
+
+This is the main screen. It holds all the reporting state and renders the map, the location button, and the submission form.
+
+**Signals (reactive state):**
+
+| Signal | Type | What it tracks |
+|---|---|---|
+| `clicked_pos` | `RwSignal<Option<(f64,f64)>>` | Where the user last clicked; `None` = no pin |
+| `damage_type` | `RwSignal<String>` | The selected damage type |
+| `severity` | `RwSignal<u8>` | Slider value 1–10 |
+| `description` | `RwSignal<String>` | Text area content |
+| `reports` | `RwSignal<Vec<DamageReport>>` | All reports, drives marker rendering |
+| `submitting` | `RwSignal<bool>` | Disables submit button while POST is in flight |
+| `fly_to` | `RwSignal<Option<(f64,f64)>>` | Bridge signal to animate the map |
+| `user_location` | `RwSignal<Option<(f64,f64)>>` | Current GPS position |
+
+`RwSignal<T>` is Leptos's reactive primitive. Any `view!` closure that calls `.get()` on a signal automatically re-runs when that signal changes — this is how the UI stays in sync without manual DOM manipulation.
+
+**On startup:**
+
+1. `spawn_local` fires a `GET /api/reports` to populate the marker list immediately.
+2. The browser's Geolocation API is called; if permission is granted, the map flies to the user's position and a blue dot appears.
+3. A global `keydown` listener is registered so pressing Escape closes the form panel.
+
+**The form panel:**
+
+The panel sits outside `MapContainer` as a sibling `<div>`. This is required because Leaflet's layer panes use CSS `transform`, which breaks `position: fixed` positioning for any element inside them.
+
+```rust
+{move || match clicked_pos.get() {
+    None => view! { <p class="panel-hint">"Click the map to drop a pin"</p> }.into_any(),
+    Some((lat, lng)) => view! { /* form */ }.into_any(),
+}}
+```
+
+`.into_any()` erases the concrete view type so both match arms are compatible. The `move ||` closure is reactive — Leptos re-runs it when `clicked_pos` changes.
+
+**Submit flow:**
+
+1. Builds a `CreateReportRequest` from current signal values.
+2. Sets `submitting = true` — disables the button.
+3. POSTs to `/api/reports` with a JSON body.
+4. On success: resets all form signals, then re-fetches `/api/reports` to update the markers.
+5. Sets `submitting = false`.
+
+---
+
+### `FlyToHandler` — the map bridge
+
+This component renders nothing visible. Its only job is to bridge the `LocationButton` (outside the map) with the Leaflet map instance (only accessible from inside the map).
 
 ```rust
 #[component]
@@ -164,273 +313,138 @@ fn FlyToHandler(fly_to: RwSignal<Option<(f64, f64)>>) -> impl IntoView {
     let ctx = use_leaflet_context();
     Effect::new(move |_| {
         if let Some((lat, lng)) = fly_to.get() {
-            if let Some(ref ctx) = ctx {
-                if let Some(map) = ctx.map() {
-                    let latlng = leaflet::LatLng::new(lat, lng);
-                    let options = web_sys::js_sys::Object::new();
-                    let _ = web_sys::js_sys::Reflect::set(&options, &"duration".into(), &JsValue::from_f64(3.0));
-                    leaflet::Map::fly_to_with_zoom_and_options(&map, &latlng, 15.0, &options);
-                }
-            }
+            // call map.flyTo(...)
         }
     });
     view! {}
 }
 ```
 
-This component renders nothing visible (`view! {}`). Its only job is to bridge the location button (which lives outside the map) with the Leaflet map object (which is only accessible from inside the map).
+`use_leaflet_context()` only works inside children of `MapContainer`. So `FlyToHandler` lives inside the map to access the context, while `LocationButton` lives outside to render correctly as a fixed button. The `fly_to` signal connects them: `LocationButton` writes to it, `FlyToHandler` reads it via `Effect::new` and calls the Leaflet API.
 
-**Why it needs to be inside `MapContainer`:** `use_leaflet_context()` retrieves the `LeafletMapContext` that `MapContainer` places into the Leptos context system. Only components rendered as children of `MapContainer` in the Leptos component tree have access to it. The `LocationButton`, which renders as a sibling of `MapContainer`, cannot call `use_leaflet_context()` — so `FlyToHandler` acts as a bridge.
+**`Effect::new`** — a reactive side effect that re-runs whenever signals it reads change. Using the tracked `ctx.map()` (not `map_untracked`) means the effect also fires when the map finishes initializing, so a geolocation result that arrives before the map is ready still triggers the animation.
 
-**Why the `LocationButton` can't be inside `MapContainer`:** Leaflet's layer panes use CSS `transform`. Any `position: fixed` element inside a transformed ancestor positions itself relative to that ancestor instead of the viewport — meaning the button would render off-screen inside the map tile panes. So `LocationButton` must live outside `MapContainer` in the DOM.
-
-**The signal-based bridge:** `fly_to: RwSignal<Option<(f64, f64)>>` is defined in `App` and passed to both components. `LocationButton` writes to it; `FlyToHandler` reads it via `Effect::new`. When the signal changes, the effect re-runs and calls `fly_to_with_zoom_and_options` on the Leaflet map.
-
-**`ctx.map()` (tracked) vs `ctx.map_untracked()`:** Using the tracked version means the effect also re-runs when the map finishes initializing. This matters on startup: if geolocation resolves before the Leaflet map is ready, the fly-to still fires once the map becomes available.
-
-**`web_sys::js_sys::Object` and `Reflect::set`:** Leaflet's `flyTo` accepts an options object `{ duration: N }` where `duration` is in seconds. There's no Rust struct for this — we have to build a raw JavaScript object. `js_sys::Object::new()` creates an empty `{}`, and `Reflect::set` sets a key on it. This is the WASM equivalent of writing `{ duration: 3.0 }` in JavaScript.
+**`web_sys::js_sys::Object` / `Reflect::set`** — Leaflet's `flyTo` accepts `{ duration: N }` in seconds. There's no Rust struct for this; we build a raw JavaScript object. This is the WASM equivalent of `{ duration: 0.1 }` in JS.
 
 ---
 
-### `LocationButton` component
+### `LocationButton` — geolocation
 
 ```rust
 #[component]
 fn LocationButton(
     fly_to: RwSignal<Option<(f64, f64)>>,
     user_location: RwSignal<Option<(f64, f64)>>,
-) -> impl IntoView {
-    let on_click = move |_| {
-        let window = web_sys::window().unwrap();
-        let geo = window.navigator().geolocation().unwrap();
-
-        let success = Closure::once(move |pos: web_sys::Position| {
-            let coords = pos.coords();
-            let lat = coords.latitude();
-            let lng = coords.longitude();
-            user_location.set(Some((lat, lng)));
-            fly_to.set(Some((lat, lng)));
-        });
-
-        let _ = geo.get_current_position(success.as_ref().unchecked_ref());
-        success.forget();
-    };
-
-    view! {
-        <button class="loc-btn" title="Go to my location" on:click=on_click>
-            "◎"
-        </button>
-    }
-}
+) -> impl IntoView { ... }
 ```
 
-**`web_sys::window().navigator().geolocation()`** — accesses the browser's Geolocation API through the chain of `window → navigator → geolocation`. Each step returns a `Result` or `Option`; we `.unwrap()` here for simplicity.
+On click: calls the browser's `getCurrentPosition` API. On success: sets `user_location` (shows the blue dot) and sets `fly_to` (animates the map there).
 
-**`Closure::once`** — creates a Rust closure that can be called exactly once from JavaScript. The browser's `getCurrentPosition` takes a JS function as its success callback; `Closure::once` wraps a Rust `FnOnce` into a form JS can call. The `move` keyword transfers ownership of `user_location` and `fly_to` into the closure.
+**`Closure::once`** — wraps a Rust `FnOnce` into a form JavaScript can call as a callback. The `move` keyword transfers ownership of the signals into the closure.
 
-**`success.as_ref().unchecked_ref::<js_sys::Function>()`** — `Closure` is a WASM value, not a Rust reference. `.as_ref()` gives a `&JsValue`, and `.unchecked_ref()` casts it to `&Function` without a runtime check. This is the standard pattern for passing Rust closures to Web APIs.
-
-**`success.forget()`** — by default, when a `Closure` is dropped (goes out of scope), its memory is freed. But the browser holds the callback and calls it asynchronously — after `on_click` has returned and `success` would normally drop. `.forget()` leaks the closure intentionally, keeping it alive until JS calls it. Without this the callback fires on freed memory and crashes.
-
-On success, two things happen: `user_location.set(...)` makes a blue dot marker appear at the location, and `fly_to.set(...)` triggers `FlyToHandler` to animate the map there.
+**`success.forget()`** — by default a `Closure` is freed when it goes out of scope. But the geolocation callback fires asynchronously, after the click handler returns. `.forget()` intentionally leaks the closure to keep it alive until JS calls it.
 
 ---
 
-### `App` component — signals
+### `AdminPage` — the password gate
+
+`AdminPage` uses a single signal to decide what to render:
 
 ```rust
-let clicked_pos: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
-let damage_type = RwSignal::new("Pothole".to_string());
-let severity = RwSignal::new(5u8);
-let description = RwSignal::new(String::new());
-let reports: RwSignal<Vec<DamageReport>> = RwSignal::new(vec![]);
-let submitting = RwSignal::new(false);
-let fly_to: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
-let user_location: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+let auth_token: RwSignal<Option<String>> = RwSignal::new(None);
 ```
 
-All reactive state is declared at the top of `App`. `RwSignal<T>` is Leptos's reactive primitive — `.set()` triggers re-renders of any part of the view that reads it via `.get()`.
+- `None` → show the login form.
+- `Some(token)` → show `<AdminPanel token=token />`.
 
-- `clicked_pos` — `None` shows the placeholder text, `Some((lat, lng))` shows the form.
-- `reports` — the live list fetched from the backend; drives the `<For>` marker loop.
-- `submitting` — disables the button and swaps its label while the POST is in flight.
-- `fly_to` — the bridge signal between `LocationButton` and `FlyToHandler`.
-- `user_location` — when `Some`, renders a blue dot marker at the current location.
+On form submit, the entered password is sent to `GET /api/admin/ping` with an `Authorization: Bearer <password>` header. If the response is `200 OK`, the password is stored in `auth_token` and the panel appears. If `401`, an error message is shown. The password never needs to be stored anywhere else — every subsequent request sends it fresh.
 
 ---
 
-### `App` component — startup effects
+### `AdminPanel` — the live report table
+
+Once authenticated, `AdminPanel` shows a table of all reports and polls for updates every 5 seconds.
+
+**The polling loop:**
 
 ```rust
 spawn_local(async move {
-    if let Ok(resp) = Request::get("/api/reports").send().await {
-        if let Ok(data) = resp.json::<Vec<DamageReport>>().await {
-            reports.set(data);
-        }
+    loop {
+        if !active.get_untracked() { break; }
+        // fetch /api/reports and update signal
+        if !active.get_untracked() { break; }
+        TimeoutFuture::new(5_000).await;
     }
 });
+on_cleanup(move || active.set(false));
 ```
 
-Fires immediately on mount. Fetches all existing reports and populates the `reports` signal so markers appear without a user action.
+`TimeoutFuture` from `gloo-timers` is an async sleep that doesn't block the browser's event loop. The `active` signal is set to `false` by `on_cleanup` when the component unmounts — this breaks the loop cleanly without leaking the task.
+
+**Why not `Interval`?** `gloo_timers::callback::Interval` is not `Send + Sync`, but Leptos's `on_cleanup` requires `Send + Sync + 'static`. The async loop with `TimeoutFuture` has none of those constraints.
+
+**Status updates:** Each row has a `<select>` dropdown. On change, it fires a `PATCH /api/reports/{id}` with `Authorization: Bearer <token>` and a JSON body of `{ "status": "InProgress" }`.
+
+**Delete:** Each row has a Delete button. On click, it fires `DELETE /api/reports/{id}`. On `204 No Content` (success), the report is removed from the local signal immediately — no re-fetch needed:
 
 ```rust
-if let Some(window) = web_sys::window() {
-    if let Ok(geo) = window.navigator().geolocation() {
-        let success = Closure::once(move |pos: web_sys::Position| {
-            let coords = pos.coords();
-            user_location.set(Some((lat, lng)));
-            fly_to.set(Some((lat, lng)));
-        });
-        let _ = geo.get_current_position(success.as_ref().unchecked_ref());
-        success.forget();
-    }
-}
+reports.update(|rs| rs.retain(|r| r.id != report_id));
 ```
-
-Also fires immediately on mount. Requests geolocation permission and, if granted, places the blue dot and flies the map to the user's location automatically. The map's default center is the US at zoom 4 — if geolocation is denied or unavailable, that's what the user sees.
-
-```rust
-window_event_listener(leptos::ev::keydown, move |e| {
-    if e.key() == "Escape" {
-        clicked_pos.set(None);
-    }
-});
-```
-
-Registers a global `keydown` listener that resets `clicked_pos` to `None` on Escape, closing the form panel. `window_event_listener` ties the listener's lifetime to the component — it's automatically removed when `App` unmounts.
 
 ---
 
-### `App` component — the map
+## Deployment with Docker + Railway
 
-```rust
-<MapContainer
-    style="height: 100vh; width: 100%;"
-    center=Position::new(39.5, -98.35)
-    zoom=4.0
-    events=map_events
->
-    <TileLayer url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" ... />
-    <FlyToHandler fly_to=fly_to />
-    <For each=move || reports.get() key=... children=|r| view! {
-        <Marker position=... icon_class="marker-dot">
-            <Popup>...</Popup>
-        </Marker>
-    } />
-    {move || user_location.get().map(|(lat, lng)| view! {
-        <Marker position=Position::new(lat, lng) icon_class="user-dot" />
-    })}
-</MapContainer>
+### Why a Dockerfile is needed
+
+Railway's default auto-detector (Railpack) only knows how to build native Rust binaries. It has no idea how to:
+- Install the WASM target (`wasm32-unknown-unknown`)
+- Install Trunk
+- Run `trunk build --release` to compile the frontend
+
+So we use a custom Dockerfile that handles all of this.
+
+### The Dockerfile — two stages
+
+**Stage 1: builder** — everything needed to compile both crates:
+
+```dockerfile
+FROM rust:1.94.1-slim AS builder
+
+RUN apt-get install -y pkg-config libssl-dev build-essential
+RUN rustup target add wasm32-unknown-unknown
+RUN cargo install trunk --locked   # --locked pins trunk's deps to its tested lockfile
+
+COPY . .
+RUN cargo build -p backend --release      # compiles the Axum binary
+RUN cd frontend && trunk build --release  # compiles the WASM bundle → frontend/dist/
 ```
 
-**CartoDB Voyager tiles** — a modern, colorful map style. Free, no API key. The `{r}` in the URL is a Leaflet placeholder for retina/HiDPI support.
+**Stage 2: final image** — only the runtime artifacts, no compiler toolchain:
 
-**`style=` on `MapContainer`** — unlike regular HTML elements, `MapContainer` is a leptos-leaflet component that doesn't forward a `class=` prop to its inner div. The dimensions must be set via inline `style=`.
+```dockerfile
+FROM debian:bookworm-slim
 
-**`<FlyToHandler>`** — renders nothing visible, only its reactive effect runs. Placed inside `MapContainer` to have access to the map context.
+COPY --from=builder /app/target/release/backend /app/backend
+COPY --from=builder /app/frontend/dist          /app/frontend/dist
 
-**`<For>`** — Leptos's reactive list renderer. More efficient than `.map()` — it diffs by key and only re-renders changed items. `key=|r| format!("{:.6},{:.6}", ...)` uses the lat/lng as a unique key.
+ENV STATIC_DIR=/app/frontend/dist
+ENV DB_PATH=/data/reports.db
+CMD ["/app/backend"]
+```
 
-**`icon_class="marker-dot"`** — uses a CSS div-based icon instead of Leaflet's default blue teardrop. The class `.marker-dot` is defined in `styles.css`.
+The final image is much smaller because it doesn't include Rust, Trunk, or any build tools.
 
-**User location marker** — rendered conditionally from `user_location`. `move || user_location.get().map(...)` is a reactive closure: it re-runs when the signal changes. When `user_location` is `None` it renders nothing; when `Some` it renders a `<Marker>` with the `.user-dot` class (a blue ring that's visually distinct from report markers).
+### Railway setup
+
+1. **Source** — connect your GitHub repo; set Builder to **Dockerfile** (not Railpack).
+2. **Volume** — add a volume mounted at `/data` for SQLite persistence. Without it the database resets on every deploy.
+3. **Variables** — set `ADMIN_PASSWORD` and `DB_PATH=/data/reports.db`. Railway sets `PORT` automatically; the backend reads it.
+4. **Networking** — set the public domain to route to port `3000` (or set `PORT=3000` in Variables so it's always consistent).
 
 ---
 
-### `App` component — the panel
-
-The form panel sits outside `MapContainer` as a sibling `<div>`. It's rendered over the map via `position: fixed; z-index: 1000` in CSS.
-
-**Why outside `MapContainer`:** Leaflet's layer panes use CSS `transform`, which turns `position: fixed` children into `position: fixed` relative to the pane rather than the viewport. Elements placed inside `MapContainer` can't reliably use fixed positioning.
-
-```rust
-{move || match clicked_pos.get() {
-    None => view! { <p class="panel-hint">"Click the map to drop a pin"</p> }.into_any(),
-    Some((lat, lng)) => view! { ... }.into_any(),
-}}
-```
-
-The `move ||` closure is a reactive block — Leptos re-runs it when `clicked_pos` changes. `.into_any()` erases the concrete view type so both match arms are compatible.
-
-### Controlled inputs
-
-```rust
-prop:value=move || severity.get().to_string()
-on:input=move |e| { severity.set(event_target_value(&e).parse::<u8>().unwrap_or(5)); }
-```
-
-`prop:value` sets the live DOM property (not the HTML attribute) to keep the input in sync with the signal. `on:input` reads back the new value on each keystroke. `event_target_value(&e)` is a Leptos helper that extracts the string value from the event's target element.
-
-### The submit handler
-
-The submit button's click handler:
-1. Builds a `CreateReportRequest` from the current signal values
-2. Sets `submitting = true` — disables the button and shows "Submitting..."
-3. POSTs to `/api/reports` via `gloo-net`
-4. On `resp.ok()` (2xx): resets all form signals, then re-fetches `/api/reports` to refresh the marker list
-5. Sets `submitting = false` regardless of success or failure
-
----
-
-### Entry point
-
-```rust
-#[wasm_bindgen(start)]
-pub fn main() {
-    mount_to_body(App);
-}
-```
-
-`#[wasm_bindgen(start)]` marks this as the WASM entry point. The browser calls it automatically when the `.wasm` module loads. `mount_to_body(App)` renders the component into `<body>`.
-
----
-
-## Why `src/main.rs` still exists
-
-```rust
-fn main() {}
-```
-
-An empty stub. Without it, certain Cargo tooling expects a binary entry point. Trunk ignores it because of `autobins = false`.
-
----
-
-## The full picture
-
-```
-Cargo.toml
-  ├── autobins = false           → ignore src/main.rs as a binary
-  ├── crate-type = ["cdylib"]    → produce a .wasm file
-  └── leptos + leptos-leaflet    → must share the same leptos version
-
-Trunk.toml
-  └── proxy /api/ → localhost:3000  → forward API calls to the backend
-
-index.html
-  ├── Leaflet CSS + JS from CDN  → map rendering
-  ├── data-trunk rel="css"       → tells Trunk to bundle styles.css
-  └── Trunk injects WASM script  → your Rust code
-
-styles.css
-  └── all visual styles (panel, inputs, button, markers, popups)
-
-src/lib.rs
-  ├── FlyToHandler               → inside MapContainer, bridges fly_to signal → map.flyTo()
-  ├── LocationButton             → outside MapContainer, fixed bottom-right button
-  ├── 8x RwSignal                → all reactive state
-  ├── spawn_local on mount       → GET /api/reports → populate reports signal
-  ├── geolocation on mount       → auto fly to user's location on startup
-  ├── window_event_listener      → Escape key closes the form panel
-  ├── MapEvents click handler    → sets clicked_pos on map click
-  ├── MapContainer + TileLayer   → Voyager tile style map
-  ├── <For> over reports         → renders a <Marker> + <Popup> per report
-  ├── user location marker       → blue dot at current location (when available)
-  ├── move || match clicked_pos  → conditional: placeholder or form
-  ├── controlled inputs          → on:input + prop:value keep signals in sync
-  ├── spawn_local + gloo-net     → async POST to /api/reports
-  ├── re-fetch reports on submit → GET /api/reports → update reports signal
-  └── #[wasm_bindgen(start)]     → browser entry point
-```
+## Concepts reference
 
 | Concept | What it means |
 |---|---|
@@ -438,38 +452,21 @@ src/lib.rs
 | `Effect::new` | Reactive side effect — re-runs whenever signals it reads change |
 | `Option<T>` in signals | Models "nothing yet" vs "something" — drives conditional rendering |
 | `move` closures | Required when a closure crosses the WASM boundary or outlives its scope |
-| `move \|\|` in `view!` | Reactive closure — re-runs automatically when signals it reads change |
+| `move \|\|` in `view!` | Reactive closure — Leptos re-runs it when signals it reads change |
 | `.into_any()` | Erases concrete view types so different `match` arms are compatible |
 | `<For>` | Reactive list renderer — diffs by key, only re-renders changed items |
+| `spawn_local` | Runs async code from a sync context in single-threaded WASM |
+| `on_cleanup` | Runs when a component unmounts — used to cancel the polling loop |
+| `TimeoutFuture::new(ms)` | Async sleep in WASM — doesn't block the browser event loop |
 | `Closure::once` | Wraps a Rust `FnOnce` so JavaScript can call it as a callback |
-| `success.forget()` | Keeps the closure alive past its Rust scope so JS can still call it |
-| `web_sys::js_sys::Reflect::set` | Sets a property on a raw JS object from Rust |
+| `success.forget()` | Keeps a Closure alive past its Rust scope so JS can call it asynchronously |
+| `Reflect::set` | Sets a property on a raw JS object from Rust |
 | `on:input` / `on:change` | Leptos event listeners; `event_target_value(&e)` extracts the string value |
 | `prop:value` | Sets the live DOM property (not HTML attribute) to keep inputs controlled |
-| `spawn_local` | Runs async code from a sync context in single-threaded WASM |
 | `resp.json::<T>()` | Deserializes the response body into type `T` using serde |
 | `resp.ok()` | True if HTTP status is 200–299 |
-| `Position::new(lat, lng)` | Required for Marker position — leptos-leaflet doesn't accept raw tuples |
-| `icon_class=` | Uses a CSS div as a Leaflet marker icon instead of the default image |
-| `use_leaflet_context()` | Retrieves the map instance — only works in children of `MapContainer` |
-| z-index: 1000 | Required to render the panel and buttons above Leaflet's layer stack |
-
----
-
-## Known limitations and future improvements
-
-### Re-fetching all reports after submission is inefficient
-
-After a successful POST, the app fires a second `GET /api/reports` to refresh the marker list. This works fine now but doesn't scale — with a large database it downloads every report just to add one new marker.
-
-**Better approach:** The POST response already returns the newly created report (the backend sends it back as `201 Created` with the report body). Instead of re-fetching the whole list, just append that single report to the signal:
-
-```rust
-if let Ok(new_report) = resp.json::<DamageReport>().await {
-    reports.update(|list| list.push(new_report));
-}
-```
-
-No second HTTP request needed. Fast regardless of how many reports exist in the database.
-
-**Even better for large datasets:** Only fetch reports within the current map viewport (bounding box query params on the GET endpoint), so the frontend never downloads reports the user can't see.
+| `use_leaflet_context()` | Retrieves the Leaflet map instance — only works inside `MapContainer` |
+| `icon_class=` | Uses a CSS div as a Leaflet marker instead of the default image |
+| `Arc<AppData>` | Shared state across async Axum handlers — reference-counted, thread-safe |
+| `Mutex<Connection>` | Ensures only one handler reads/writes SQLite at a time |
+| Multi-stage Docker build | Stage 1 compiles everything; stage 2 copies only the output — smaller image |
