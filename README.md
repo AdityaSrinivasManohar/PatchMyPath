@@ -64,8 +64,7 @@ See [PLAN.md](./PLAN.md) for the full step-by-step build plan.
 - [x] **Step 6** — SQLite persistence
 - [x] **Step 7** — GUI polish (custom markers, location button, styled panel, escape to close)
 - [x] **Step 8** — Admin panel (password gate, report table, status updates, delete)
+- [x] **Step 9** — Railway deployment
 
 ### Next
-
-- [ ] **Step 9** — Image upload support
-- [ ] **Step 10** — Railway deployment
+- [ ] **Step 10** — Image upload support (I dont have money to store images though :/ )
