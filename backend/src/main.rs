@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use shared::{CreateReportRequest, DamageReport, DamageType, FixStatus, GPSLocation, UpdateStatusRequest};
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 struct AppData {
     db: Mutex<Connection>,
@@ -19,7 +20,8 @@ struct AppData {
 type AppState = Arc<AppData>;
 
 fn init_db() -> Connection {
-    let conn = Connection::open("reports.db").unwrap();
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "reports.db".to_string());
+    let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS reports (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,6 +179,10 @@ async fn main() {
         admin_password,
     });
 
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "frontend/dist".to_string());
+    let serve_dir = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(format!("{}/index.html", &static_dir)));
+
     let app = Router::new()
         .route("/api/reports", get(list_reports))
         .route("/api/reports", post(create_report))
@@ -184,9 +190,12 @@ async fn main() {
         .route("/api/reports/{id}", delete(delete_report))
         .route("/api/admin/ping", get(admin_ping))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+        .fallback_service(serve_dir);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Listening on http://localhost:3000");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    println!("Listening on http://{}", addr);
     axum::serve(listener, app).await.unwrap();
 }
