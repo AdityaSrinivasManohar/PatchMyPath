@@ -15,6 +15,8 @@
 
 ---
 
+Feel free to contribute to the database and get an actual feel for the project here - https://patchmypath-production.up.railway.app/
+
 ## What it does
 
 - Click anywhere on a map to drop a pin
